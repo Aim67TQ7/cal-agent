@@ -57,6 +57,24 @@ cert_retention_years    := 3 (minimum)
 
 ---
 
+### 品牌标识 | Branding
+```
+logo_file     := bunting-logo.png
+primary_color := #003366
+accent_color  := #CC0000
+font          := Helvetica
+company_address := {
+  line1 := "Bunting Magnetics Company"
+  line2 := "500 S. Spencer Ave."
+  line3 := "Newton, KS 67114"
+  phone := "(316) 284-2020"
+  web   := "bfrgroup.com"
+}
+report_footer := "Confidential — Bunting Magnetics Quality Department"
+```
+
+---
+
 ### 注意事项 | Special Notes
 <!-- Updated during engagement based on feedback -->
 ```

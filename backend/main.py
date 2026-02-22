@@ -10,6 +10,8 @@ from jose import jwt, JWTError
 from datetime import datetime, timedelta
 from pathlib import Path
 import os
+import re
+import io
 import uuid
 import json
 
@@ -67,6 +69,7 @@ class QuestionRequest(BaseModel):
 
 class DownloadRequest(BaseModel):
     evidence_type: str = "all_current"
+    format: str = "pdf"  # "pdf" or "text"
 
 class EquipmentCreate(BaseModel):
     equipment_id: str
@@ -152,6 +155,210 @@ def load_tenant_kernel(db: Session, tenant_id: str) -> str:
         kernel = kernel + "\n\n---\n\n" + tenant_kernel
 
     return kernel
+
+def load_tenant_branding(db: Session, tenant_id: str) -> dict:
+    """Parse branding block from tenant kernel."""
+    result = db.execute(text(
+        "SELECT tenant_slug, company_name FROM tenants WHERE id = :tid"
+    ), {"tid": tenant_id})
+    tenant = result.fetchone()
+    if not tenant:
+        return {"company_name": "Unknown", "slug": "unknown"}
+
+    slug = tenant[0]
+    company_name = tenant[1]
+
+    branding = {
+        "company_name": company_name,
+        "slug": slug,
+        "logo_path": None,
+        "primary_color": "#003366",
+        "accent_color": "#CC0000",
+        "font": "Helvetica",
+        "address_lines": [],
+        "phone": "",
+        "web": "",
+        "report_footer": f"Confidential — {company_name}",
+    }
+
+    # Try to read branding from tenant kernel
+    tenant_kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
+    if not tenant_kernel_path.exists():
+        return branding
+
+    content = tenant_kernel_path.read_text()
+
+    # Parse branding block
+    brand_match = re.search(r'### 品牌标识.*?```(.*?)```', content, re.DOTALL)
+    if not brand_match:
+        return branding
+
+    block = brand_match.group(1)
+    for line in block.strip().split("\n"):
+        line = line.strip()
+        if ":=" not in line:
+            continue
+        key, val = line.split(":=", 1)
+        key = key.strip()
+        val = val.strip().strip('"')
+        if key == "logo_file":
+            logo_path = Path(f"/app/uploads/tenants/{slug}/{val}")
+            if logo_path.exists():
+                branding["logo_path"] = str(logo_path)
+        elif key == "primary_color":
+            branding["primary_color"] = val
+        elif key == "accent_color":
+            branding["accent_color"] = val
+        elif key == "font":
+            branding["font"] = val
+        elif key == "report_footer":
+            branding["report_footer"] = val
+        elif key == "phone":
+            branding["phone"] = val
+        elif key == "web":
+            branding["web"] = val
+        elif key in ("line1", "line2", "line3"):
+            branding["address_lines"].append(val)
+
+    return branding
+
+
+def hex_to_rgb(hex_color: str) -> tuple:
+    """Convert hex color to RGB tuple (0-1 range for reportlab)."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return (r / 255.0, g / 255.0, b / 255.0)
+
+
+def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_summary: str) -> bytes:
+    """Generate a branded PDF evidence package."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.colors import Color, HexColor
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.75*inch, bottomMargin=0.75*inch)
+
+    primary = HexColor(branding["primary_color"])
+    accent = HexColor(branding["accent_color"])
+    styles = getSampleStyleSheet()
+
+    # Custom styles
+    styles.add(ParagraphStyle(
+        "BrandTitle", parent=styles["Title"], textColor=primary, fontSize=22, spaceAfter=6
+    ))
+    styles.add(ParagraphStyle(
+        "BrandSubtitle", parent=styles["Normal"], textColor=primary, fontSize=11, spaceAfter=12
+    ))
+    styles.add(ParagraphStyle(
+        "SectionHead", parent=styles["Heading2"], textColor=primary, fontSize=14, spaceBefore=16, spaceAfter=8
+    ))
+    styles.add(ParagraphStyle(
+        "Footer", parent=styles["Normal"], textColor=HexColor("#888888"), fontSize=8, alignment=TA_CENTER
+    ))
+
+    elements = []
+
+    # Logo
+    if branding.get("logo_path") and Path(branding["logo_path"]).exists():
+        logo = Image(branding["logo_path"], width=2*inch, height=1*inch)
+        logo.hAlign = "LEFT"
+        elements.append(logo)
+        elements.append(Spacer(1, 12))
+
+    # Title block
+    elements.append(Paragraph("Calibration Evidence Package", styles["BrandTitle"]))
+    elements.append(Paragraph(branding["company_name"], styles["BrandSubtitle"]))
+
+    # Address
+    for line in branding.get("address_lines", []):
+        elements.append(Paragraph(line, styles["Normal"]))
+    if branding.get("phone"):
+        elements.append(Paragraph(branding["phone"], styles["Normal"]))
+    if branding.get("web"):
+        elements.append(Paragraph(branding["web"], styles["Normal"]))
+
+    elements.append(Spacer(1, 20))
+
+    # Cover stats
+    total = len(records)
+    current = sum(1 for r in records if r[6] == "current")
+    overdue = sum(1 for r in records if r[6] == "overdue")
+    expiring = sum(1 for r in records if r[6] == "expiring_soon")
+    critical_count = sum(1 for r in records if r[2])
+    compliance_rate = f"{(current / total * 100):.1f}%" if total > 0 else "N/A"
+
+    cover_data = [
+        ["Report Type", evidence_type.replace("_", " ").title()],
+        ["Generated", datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")],
+        ["Total Equipment", str(total)],
+        ["Compliance Rate", compliance_rate],
+        ["Current", str(current)],
+        ["Expiring Soon", str(expiring)],
+        ["Overdue", str(overdue)],
+        ["Critical Items", str(critical_count)],
+    ]
+    cover_table = Table(cover_data, colWidths=[2*inch, 3*inch])
+    cover_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), primary),
+        ("TEXTCOLOR", (0, 0), (0, -1), HexColor("#FFFFFF")),
+        ("FONTNAME", (0, 0), (-1, -1), branding.get("font", "Helvetica")),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("PADDING", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#CCCCCC")),
+    ]))
+    elements.append(cover_table)
+    elements.append(Spacer(1, 20))
+
+    # AI Summary
+    elements.append(Paragraph("Executive Summary", styles["SectionHead"]))
+    for para in ai_summary.split("\n\n"):
+        clean = para.strip()
+        if clean:
+            # Strip markdown bold/headers for PDF
+            clean = re.sub(r'[#*]+\s*', '', clean)
+            clean = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', clean)
+            elements.append(Paragraph(clean, styles["Normal"]))
+            elements.append(Spacer(1, 6))
+
+    elements.append(Spacer(1, 12))
+
+    # Equipment detail table
+    if records:
+        elements.append(Paragraph("Calibration Records", styles["SectionHead"]))
+        header = ["Equipment ID", "Type", "Critical", "Cal Date", "Exp Date", "Lab", "Status", "Result"]
+        table_data = [header]
+        for r in records:
+            status_display = str(r[6] or "").replace("_", " ").title()
+            table_data.append([
+                str(r[0]), str(r[1]), "YES" if r[2] else "",
+                str(r[3] or ""), str(r[4] or ""), str(r[5] or ""),
+                status_display, str(r[8] or ""),
+            ])
+
+        t = Table(table_data, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), primary),
+            ("TEXTCOLOR", (0, 0), (-1, 0), HexColor("#FFFFFF")),
+            ("FONTNAME", (0, 0), (-1, 0), branding.get("font", "Helvetica") + "-Bold"),
+            ("FONTNAME", (0, 1), (-1, -1), branding.get("font", "Helvetica")),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("PADDING", (0, 0), (-1, -1), 5),
+            ("GRID", (0, 0), (-1, -1), 0.5, HexColor("#CCCCCC")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [HexColor("#FFFFFF"), HexColor("#F5F5F5")]),
+        ]))
+        elements.append(t)
+
+    # Footer
+    elements.append(Spacer(1, 30))
+    elements.append(Paragraph(branding.get("report_footer", ""), styles["Footer"]))
+
+    doc.build(elements)
+    return buf.getvalue()
+
 
 def call_agent(kernel: str, user_message: str, context: str = "") -> dict:
     """Call Claude with tenant-specific kernel."""
@@ -380,12 +587,51 @@ async def ask_question(
 
     return {"status": "success", "answer": agent_response["text"]}
 
+@app.post("/cal/upload-logo")
+async def upload_logo(
+    file: UploadFile = File(...),
+    auth: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    """Upload tenant logo for branded reports."""
+    if auth["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    result = db.execute(text(
+        "SELECT tenant_slug FROM tenants WHERE id = :tid"
+    ), {"tid": auth["tenant_id"]})
+    tenant = result.fetchone()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    slug = tenant[0]
+    logo_dir = Path(f"/app/uploads/tenants/{slug}")
+    logo_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read the branding block to get expected filename
+    tenant_kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
+    logo_filename = "logo.png"  # default
+    if tenant_kernel_path.exists():
+        content = tenant_kernel_path.read_text()
+        match = re.search(r'logo_file\s*:=\s*(\S+)', content)
+        if match:
+            logo_filename = match.group(1)
+
+    file_path = logo_dir / logo_filename
+    file_content = await file.read()
+    file_path.write_bytes(file_content)
+
+    return {"status": "success", "message": f"Logo uploaded as {logo_filename}", "path": str(file_path)}
+
+
 @app.post("/cal/download")
 async def generate_evidence(
     req: DownloadRequest,
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
+    from fastapi.responses import Response
+
     set_tenant_context(db, auth["tenant_id"])
 
     # Build query based on evidence type
@@ -409,10 +655,9 @@ async def generate_evidence(
     kernel = load_tenant_kernel(db, auth["tenant_id"])
     prompt = f"""Generate an audit evidence package summary for these calibration records.
 Include:
-- Cover sheet: total equipment, compliance rate, date generated
-- Records organized by equipment type
+- Executive summary of calibration program health
 - Items requiring immediate attention (overdue or expiring)
-- Recommendation summary
+- Recommendations organized by priority
 
 Evidence type requested: {req.evidence_type}
 Total records: {len(records)}
@@ -427,6 +672,18 @@ Records:
     log_tokens(db, auth["tenant_id"], auth["user_id"], "download", agent_response)
     db.commit()
 
+    # Generate branded PDF
+    if req.format == "pdf":
+        branding = load_tenant_branding(db, auth["tenant_id"])
+        pdf_bytes = generate_branded_pdf(branding, records, req.evidence_type, agent_response["text"])
+        filename = f"cal_evidence_{req.evidence_type}_{datetime.utcnow().strftime('%Y%m%d')}.pdf"
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Fallback: text/JSON response
     return {
         "status": "success",
         "package_description": agent_response["text"],
