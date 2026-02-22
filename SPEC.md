@@ -104,15 +104,15 @@
 | POST | `/auth/login` | Email/password login → JWT |
 | POST | `/auth/register` | Create user for existing tenant |
 
-### Agent (Tenant-Scoped)
+### Agent (Tenant-Scoped via JWT)
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/cal/{slug}/upload` | Upload cal cert → AI extraction |
-| POST | `/cal/{slug}/question` | Natural language Q&A |
-| POST | `/cal/{slug}/download` | Generate evidence package |
-| GET | `/cal/{slug}/equipment` | List equipment + latest cal status |
-| POST | `/cal/{slug}/equipment` | Add equipment to registry |
-| GET | `/cal/{slug}/dashboard` | Dashboard stats + activity |
+| POST | `/cal/upload` | Upload cal cert → AI extraction |
+| POST | `/cal/question` | Natural language Q&A |
+| POST | `/cal/download` | Generate evidence package |
+| GET | `/cal/equipment` | List equipment + latest cal status |
+| POST | `/cal/equipment` | Add equipment to registry |
+| GET | `/cal/dashboard` | Dashboard stats + activity |
 
 ### System
 | Method | Path | Description |
