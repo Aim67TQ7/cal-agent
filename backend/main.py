@@ -110,31 +110,47 @@ def set_tenant_context(db: Session, tenant_id: str):
 # ============================================================
 
 def load_tenant_kernel(db: Session, tenant_id: str) -> str:
-    """Load kernel template and inject tenant-specific data."""
-    kernel_path = Path("/app/kernels/calibrations_v1.0.ttc.md")
-    if not kernel_path.exists():
-        return "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
+    """Load two-layer kernel: agent kernel (shared) + tenant kernel (per-customer)."""
 
-    kernel_template = kernel_path.read_text()
+    # Layer 1: Agent kernel — maintained by n0v8v, shared across all tenants
+    agent_kernel_path = Path("/app/kernels/calibrations_v1.0.ttc.md")
+    if agent_kernel_path.exists():
+        agent_kernel = agent_kernel_path.read_text()
+    else:
+        agent_kernel = "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
 
+    # Get tenant info
+    result = db.execute(text(
+        "SELECT company_name, tenant_slug FROM tenants WHERE id = :tid"
+    ), {"tid": tenant_id})
+    tenant = result.fetchone()
+    tenant_name = tenant[0] if tenant else "Unknown"
+    tenant_slug = tenant[1] if tenant else "unknown"
+
+    # Get equipment registry
     result = db.execute(text("""
         SELECT equipment_id, equipment_type, cal_frequency_months, lab_name, critical
         FROM equipment WHERE tenant_id = :tid ORDER BY equipment_type, equipment_id
     """), {"tid": tenant_id})
     equipment = result.fetchall()
 
-    result = db.execute(text(
-        "SELECT company_name FROM tenants WHERE id = :tid"
-    ), {"tid": tenant_id})
-    tenant = result.fetchone()
-
     equipment_list = "\n".join([
         f"  {eq[0]}: type={eq[1]} | freq={eq[2]}mo | lab={eq[3]} | critical={eq[4]}"
         for eq in equipment
     ]) or "  No equipment registered yet."
 
-    kernel = kernel_template.replace("{TENANT_NAME}", tenant[0] if tenant else "Unknown")
+    # Inject variables into agent kernel
+    kernel = agent_kernel.replace("{TENANT_NAME}", tenant_name)
     kernel = kernel.replace("{EQUIPMENT_LIST}", equipment_list)
+
+    # Layer 2: Tenant kernel — per-customer customizations
+    tenant_kernel_path = Path(f"/app/kernels/tenants/{tenant_slug}.ttc.md")
+    if tenant_kernel_path.exists():
+        tenant_kernel = tenant_kernel_path.read_text()
+        tenant_kernel = tenant_kernel.replace("{TENANT_NAME}", tenant_name)
+        tenant_kernel = tenant_kernel.replace("{EQUIPMENT_LIST}", equipment_list)
+        kernel = kernel + "\n\n---\n\n" + tenant_kernel
+
     return kernel
 
 def call_agent(kernel: str, user_message: str, context: str = "") -> dict:
