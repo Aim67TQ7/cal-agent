@@ -29,7 +29,7 @@ services:
     build: ./backend
     container_name: cal-backend
     environment:
-      DATABASE_URL: postgresql://cal_admin:${DB_PASSWORD}@cal-postgres:5432/cal_gp3
+      DATABASE_URL: postgresql://cal_app:${DB_APP_PASSWORD}@cal-postgres:5432/cal_gp3
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       SECRET_KEY: ${SECRET_KEY}
       ENVIRONMENT: ${ENVIRONMENT:-production}
