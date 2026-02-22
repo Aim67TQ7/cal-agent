@@ -111,7 +111,7 @@ def set_tenant_context(db: Session, tenant_id: str):
 
 def load_tenant_kernel(db: Session, tenant_id: str) -> str:
     """Load kernel template and inject tenant-specific data."""
-    kernel_path = Path("/app/kernels/calibrations_v1.0.ttc")
+    kernel_path = Path("/app/kernels/calibrations_v1.0.ttc.md")
     if not kernel_path.exists():
         return "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
 
