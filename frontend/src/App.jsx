@@ -135,7 +135,7 @@ function StatCard({ label, value, color }) {
 // ============================================================
 // UPLOAD
 // ============================================================
-function UploadPage({ token, slug }) {
+function UploadPage({ token }) {
   const [response, setResponse] = useState(null)
   const [loading, setLoading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
@@ -148,7 +148,7 @@ function UploadPage({ token, slug }) {
     const form = new FormData()
     form.append('file', file)
     try {
-      const res = await api(token).post(`/cal/${slug}/upload`, form)
+      const res = await api(token).post('/cal/upload', form)
       setResponse(res.data)
     } catch (err) {
       setResponse({ status: 'error', message: err.response?.data?.detail || 'Upload failed' })
@@ -212,7 +212,7 @@ function UploadPage({ token, slug }) {
 // ============================================================
 // QUESTION
 // ============================================================
-function QuestionPage({ token, slug }) {
+function QuestionPage({ token }) {
   const [question, setQuestion] = useState('')
   const [history, setHistory] = useState([])
   const [loading, setLoading] = useState(false)
@@ -224,7 +224,7 @@ function QuestionPage({ token, slug }) {
     const q = question
     setQuestion('')
     try {
-      const res = await api(token).post(`/cal/${slug}/question`, { question: q })
+      const res = await api(token).post('/cal/question', { question: q })
       setHistory(prev => [{ q, a: res.data.answer, ts: new Date() }, ...prev])
     } catch (err) {
       setHistory(prev => [{ q, a: 'Error: ' + (err.response?.data?.detail || 'Request failed'), ts: new Date() }, ...prev])
@@ -265,7 +265,7 @@ function QuestionPage({ token, slug }) {
 // ============================================================
 // EVIDENCE DOWNLOAD
 // ============================================================
-function DownloadPage({ token, slug }) {
+function DownloadPage({ token }) {
   const [evidenceType, setEvidenceType] = useState('all_current')
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -274,7 +274,7 @@ function DownloadPage({ token, slug }) {
     setLoading(true)
     setResult(null)
     try {
-      const res = await api(token).post(`/cal/${slug}/download`, { evidence_type: evidenceType })
+      const res = await api(token).post('/cal/download', { evidence_type: evidenceType })
       setResult(res.data)
     } catch (err) {
       setResult({ status: 'error', package_description: err.response?.data?.detail || 'Generation failed' })
@@ -320,7 +320,7 @@ function DownloadPage({ token, slug }) {
 // ============================================================
 // EQUIPMENT
 // ============================================================
-function EquipmentPage({ token, slug }) {
+function EquipmentPage({ token }) {
   const [equipment, setEquipment] = useState([])
   const [showAdd, setShowAdd] = useState(false)
   const [form, setForm] = useState({ equipment_id: '', equipment_type: '', cal_frequency_months: 12, lab_name: '', critical: false })
@@ -329,7 +329,7 @@ function EquipmentPage({ token, slug }) {
 
   const loadEquipment = async () => {
     try {
-      const res = await api(token).get(`/cal/${slug}/equipment`)
+      const res = await api(token).get('/cal/equipment')
       setEquipment(res.data.equipment)
     } catch { }
   }
@@ -337,7 +337,7 @@ function EquipmentPage({ token, slug }) {
   const handleAdd = async (e) => {
     e.preventDefault()
     try {
-      await api(token).post(`/cal/${slug}/equipment`, form)
+      await api(token).post('/cal/equipment', form)
       setShowAdd(false)
       setForm({ equipment_id: '', equipment_type: '', cal_frequency_months: 12, lab_name: '', critical: false })
       loadEquipment()
@@ -422,37 +422,32 @@ const NAV = [
 
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem('cal_token'))
-  const [slug, setSlug] = useState(localStorage.getItem('cal_slug'))
   const [company, setCompany] = useState(localStorage.getItem('cal_company'))
   const [page, setPage] = useState('dashboard')
   const [dashData, setDashData] = useState(null)
 
   useEffect(() => {
-    if (token && slug) loadDashboard()
-  }, [token, slug])
+    if (token) loadDashboard()
+  }, [token])
 
   const loadDashboard = async () => {
     try {
-      const res = await api(token).get(`/cal/${slug}/dashboard`)
+      const res = await api(token).get('/cal/dashboard')
       setDashData(res.data)
     } catch { }
   }
 
   const handleLogin = (data) => {
     setToken(data.token)
-    setSlug(data.tenant_slug)
     setCompany(data.company_name)
     localStorage.setItem('cal_token', data.token)
-    localStorage.setItem('cal_slug', data.tenant_slug)
     localStorage.setItem('cal_company', data.company_name)
   }
 
   const handleLogout = () => {
     setToken(null)
-    setSlug(null)
     setCompany(null)
     localStorage.removeItem('cal_token')
-    localStorage.removeItem('cal_slug')
     localStorage.removeItem('cal_company')
   }
 
@@ -498,10 +493,10 @@ export default function App() {
       {/* Main Content */}
       <div style={{ flex: 1, padding: 32, maxWidth: 1100 }}>
         {page === 'dashboard' && <Dashboard data={dashData} />}
-        {page === 'upload' && <UploadPage token={token} slug={slug} />}
-        {page === 'question' && <QuestionPage token={token} slug={slug} />}
-        {page === 'download' && <DownloadPage token={token} slug={slug} />}
-        {page === 'equipment' && <EquipmentPage token={token} slug={slug} />}
+        {page === 'upload' && <UploadPage token={token} />}
+        {page === 'question' && <QuestionPage token={token} />}
+        {page === 'download' && <DownloadPage token={token} />}
+        {page === 'equipment' && <EquipmentPage token={token} />}
       </div>
     </div>
   )

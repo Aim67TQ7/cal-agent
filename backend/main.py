@@ -1,10 +1,10 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from anthropic import Anthropic
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
@@ -60,7 +60,7 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     name: str
-    tenant_slug: str
+    tenant_code: str  # opaque registration code, not slug
 
 class QuestionRequest(BaseModel):
     question: str
@@ -97,7 +97,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         return {
             "user_id": payload["user_id"],
             "tenant_id": payload["tenant_id"],
-            "tenant_slug": payload["tenant_slug"],
             "role": payload.get("role", "user"),
         }
     except JWTError:
@@ -105,10 +104,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 def set_tenant_context(db: Session, tenant_id: str):
     db.execute(text("SET LOCAL app.current_tenant_id = :tid"), {"tid": tenant_id})
-
-def verify_tenant_access(auth: dict, tenant_slug: str):
-    if auth["tenant_slug"] != tenant_slug:
-        raise HTTPException(status_code=403, detail="Access denied to this tenant")
 
 # ============================================================
 # KERNEL LOADER
@@ -176,7 +171,7 @@ def log_tokens(db: Session, tenant_id: str, user_id: str, request_type: str, age
 @app.post("/auth/login")
 async def login(req: LoginRequest, db: Session = Depends(get_db)):
     result = db.execute(text("""
-        SELECT u.id, u.password_hash, u.tenant_id, u.role, t.tenant_slug, t.company_name
+        SELECT u.id, u.password_hash, u.tenant_id, u.role, t.company_name
         FROM users u JOIN tenants t ON u.tenant_id = t.id
         WHERE u.email = :email
     """), {"email": req.email})
@@ -192,28 +187,25 @@ async def login(req: LoginRequest, db: Session = Depends(get_db)):
     token = jwt.encode({
         "user_id": str(user[0]),
         "tenant_id": str(user[2]),
-        "tenant_slug": user[4],
         "role": user[3],
         "exp": datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS),
     }, SECRET_KEY, algorithm=ALGORITHM)
 
     return {
         "token": token,
-        "tenant_slug": user[4],
-        "company_name": user[5],
+        "company_name": user[4],
         "role": user[3],
-        "redirect": f"/cal/{user[4]}",
     }
 
 @app.post("/auth/register")
 async def register(req: RegisterRequest, db: Session = Depends(get_db)):
-    # Verify tenant exists
+    # Look up tenant by slug (used only at registration, never in URLs)
     result = db.execute(text(
         "SELECT id FROM tenants WHERE tenant_slug = :slug AND subscription_status = 'active'"
-    ), {"slug": req.tenant_slug})
+    ), {"slug": req.tenant_code})
     tenant = result.fetchone()
     if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+        raise HTTPException(status_code=404, detail="Invalid registration code")
 
     # Check email not taken
     result = db.execute(text("SELECT id FROM users WHERE email = :email"), {"email": req.email})
@@ -230,17 +222,15 @@ async def register(req: RegisterRequest, db: Session = Depends(get_db)):
     return {"status": "success", "message": "User created. Please login."}
 
 # ============================================================
-# CALIBRATION AGENT ENDPOINTS
+# CALIBRATION AGENT ENDPOINTS — tenant derived from JWT only
 # ============================================================
 
-@app.post("/cal/{tenant_slug}/upload")
+@app.post("/cal/upload")
 async def upload_cert(
-    tenant_slug: str,
     file: UploadFile = File(...),
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    verify_tenant_access(auth, tenant_slug)
     set_tenant_context(db, auth["tenant_id"])
 
     # Save file
@@ -275,7 +265,6 @@ Return ONLY a valid JSON object:
     try:
         data = json.loads(agent_response["text"])
     except json.JSONDecodeError:
-        # Try to extract JSON from response
         text_resp = agent_response["text"]
         start = text_resp.find("{")
         end = text_resp.rfind("}") + 1
@@ -336,14 +325,12 @@ Return ONLY a valid JSON object:
         "data": data,
     }
 
-@app.post("/cal/{tenant_slug}/question")
+@app.post("/cal/question")
 async def ask_question(
-    tenant_slug: str,
     req: QuestionRequest,
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    verify_tenant_access(auth, tenant_slug)
     set_tenant_context(db, auth["tenant_id"])
 
     # Build context from calibration data
@@ -377,14 +364,12 @@ async def ask_question(
 
     return {"status": "success", "answer": agent_response["text"]}
 
-@app.post("/cal/{tenant_slug}/download")
+@app.post("/cal/download")
 async def generate_evidence(
-    tenant_slug: str,
     req: DownloadRequest,
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    verify_tenant_access(auth, tenant_slug)
     set_tenant_context(db, auth["tenant_id"])
 
     # Build query based on evidence type
@@ -437,13 +422,11 @@ Records:
 # EQUIPMENT MANAGEMENT
 # ============================================================
 
-@app.get("/cal/{tenant_slug}/equipment")
+@app.get("/cal/equipment")
 async def list_equipment(
-    tenant_slug: str,
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    verify_tenant_access(auth, tenant_slug)
     set_tenant_context(db, auth["tenant_id"])
 
     result = db.execute(text("""
@@ -481,14 +464,12 @@ async def list_equipment(
         "total": len(rows),
     }
 
-@app.post("/cal/{tenant_slug}/equipment")
+@app.post("/cal/equipment")
 async def add_equipment(
-    tenant_slug: str,
     eq: EquipmentCreate,
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    verify_tenant_access(auth, tenant_slug)
     set_tenant_context(db, auth["tenant_id"])
 
     db.execute(text("""
@@ -510,16 +491,13 @@ async def add_equipment(
 # DASHBOARD DATA
 # ============================================================
 
-@app.get("/cal/{tenant_slug}/dashboard")
+@app.get("/cal/dashboard")
 async def dashboard(
-    tenant_slug: str,
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    verify_tenant_access(auth, tenant_slug)
     set_tenant_context(db, auth["tenant_id"])
 
-    # Counts
     eq_count = db.execute(text(
         "SELECT COUNT(*) FROM equipment WHERE tenant_id = :tid"
     ), {"tid": auth["tenant_id"]}).scalar()
@@ -529,7 +507,6 @@ async def dashboard(
         WHERE tenant_id = :tid GROUP BY status
     """), {"tid": auth["tenant_id"]}).fetchall()
 
-    # Upcoming expirations (next 60 days)
     upcoming = db.execute(text("""
         SELECT e.equipment_id, e.equipment_type, e.critical,
                cr.expiration_date, cr.status
@@ -541,7 +518,6 @@ async def dashboard(
         ORDER BY cr.expiration_date ASC
     """), {"tid": auth["tenant_id"]}).fetchall()
 
-    # Token usage this month
     token_usage = db.execute(text("""
         SELECT COALESCE(SUM(input_tokens + output_tokens), 0),
                COALESCE(SUM(cost), 0)
@@ -550,7 +526,6 @@ async def dashboard(
           AND timestamp >= DATE_TRUNC('month', CURRENT_DATE)
     """), {"tid": auth["tenant_id"]}).fetchone()
 
-    # Recent events
     events = db.execute(text("""
         SELECT ce.event_type, ce.event_data, ce.created_at, e.equipment_id
         FROM calibration_events ce
