@@ -1,0 +1,37 @@
+# ============================================================
+# cal.gp3.app — APPEND to /opt/n0v8v/Caddyfile
+# ============================================================
+
+# Calibration Agent
+cal.gp3.app {
+    # API routes → cal-backend container
+    handle /auth/* {
+        reverse_proxy cal-backend:8000
+    }
+    handle /cal/* {
+        reverse_proxy cal-backend:8000
+    }
+    handle /health {
+        reverse_proxy cal-backend:8000
+    }
+    handle /docs {
+        reverse_proxy cal-backend:8000
+    }
+    handle /openapi.json {
+        reverse_proxy cal-backend:8000
+    }
+
+    # Frontend (static files)
+    handle {
+        root * /cal/web
+        try_files {path} /index.html
+        file_server
+    }
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+}
