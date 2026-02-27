@@ -22,7 +22,7 @@ import json
 app = FastAPI(
     title="cal.gp3.app - Calibration Agent",
     description="Multi-tenant calibration management powered by AI",
-    version="2.0.0",
+    version="2.3.0",
 )
 
 app.add_middleware(
@@ -37,18 +37,66 @@ app.add_middleware(
 # CONFIG
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase direct connection string
+DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase direct connection string (may be None)
 SECRET_KEY = os.getenv("SECRET_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ezlmmegowggujpcnzoda.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10)
-SessionLocal = sessionmaker(bind=engine)
+# SQLAlchemy — optional, may fail if no DB connection
+try:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10) if DATABASE_URL else None
+    SessionLocal = sessionmaker(bind=engine) if engine else None
+except Exception:
+    engine = None
+    SessionLocal = None
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+# ============================================================
+# SUPABASE REST CLIENT (replaces direct Postgres when unavailable)
+# ============================================================
+
+import httpx
+
+_sb_headers = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Accept-Profile": "cal",
+    "Content-Profile": "cal",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+}
+
+def sb_get(table: str, params: dict = None) -> list:
+    """GET from Supabase REST API (cal schema)."""
+    r = httpx.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers, params=params or {}, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def sb_post(table: str, data: dict) -> dict:
+    """INSERT into Supabase REST API (cal schema)."""
+    r = httpx.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers, json=data, timeout=15)
+    r.raise_for_status()
+    result = r.json()
+    return result[0] if isinstance(result, list) and result else result
+
+def sb_patch(table: str, params: dict, data: dict) -> list:
+    """UPDATE via Supabase REST API (cal schema)."""
+    r = httpx.patch(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers, params=params, json=data, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def sb_rpc(fn_name: str, params: dict = None) -> any:
+    """Call a Supabase RPC function."""
+    r = httpx.post(f"{SUPABASE_URL}/rest/v1/rpc/{fn_name}", headers=_sb_headers, json=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 # ============================================================
 # MODELS
@@ -89,11 +137,14 @@ class EquipmentCreate(BaseModel):
 # ============================================================
 
 def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    if SessionLocal:
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+    else:
+        yield None  # No direct DB — using Supabase REST
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -110,7 +161,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 # KERNEL LOADER
 # ============================================================
 
-def load_tenant_kernel(db: Session, company_id: int) -> str:
+def load_tenant_kernel(db_unused, company_id: int) -> str:
     """Load two-layer kernel: agent kernel (shared) + tenant kernel (per-customer)."""
 
     # Layer 1: Agent kernel
@@ -120,23 +171,27 @@ def load_tenant_kernel(db: Session, company_id: int) -> str:
     else:
         agent_kernel = "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
 
-    # Get company info
-    result = db.execute(text(
-        "SELECT name, slug FROM cal.companies WHERE id = :cid"
-    ), {"cid": company_id})
-    company = result.fetchone()
-    company_name = company[0] if company else "Unknown"
-    company_slug = company[1] if company else "unknown"
+    # Get company info via REST
+    try:
+        companies = sb_get("companies", {"select": "name,slug", "id": f"eq.{company_id}"})
+        company = companies[0] if companies else {}
+    except Exception:
+        company = {}
+    company_name = company.get("name", "Unknown")
+    company_slug = company.get("slug", "unknown")
 
-    # Get equipment registry
-    result = db.execute(text("""
-        SELECT number, type, frequency, ownership, description
-        FROM cal.tools WHERE company_id = :cid ORDER BY type, number
-    """), {"cid": company_id})
-    equipment = result.fetchall()
+    # Get equipment registry via REST
+    try:
+        equipment = sb_get("tools", {
+            "select": "number,type,frequency,ownership,description",
+            "company_id": f"eq.{company_id}",
+            "order": "type,number",
+        })
+    except Exception:
+        equipment = []
 
     equipment_list = "\n".join([
-        f"  {eq[0]}: type={eq[1]} | freq={eq[2]} | owner={eq[3]} | {eq[4] or ''}"
+        f"  {eq.get('number','')}: type={eq.get('type','')} | freq={eq.get('frequency','')} | owner={eq.get('ownership','')} | {eq.get('description','')}"
         for eq in equipment
     ]) or "  No equipment registered yet."
 
@@ -154,17 +209,18 @@ def load_tenant_kernel(db: Session, company_id: int) -> str:
 
     return kernel
 
-def load_tenant_branding(db: Session, company_id: int) -> dict:
+def load_tenant_branding(company_id: int) -> dict:
     """Parse branding block from tenant kernel."""
-    result = db.execute(text(
-        "SELECT slug, name FROM cal.companies WHERE id = :cid"
-    ), {"cid": company_id})
-    company = result.fetchone()
+    try:
+        companies = sb_get("companies", {"select": "slug,name", "id": f"eq.{company_id}"})
+        company = companies[0] if companies else None
+    except Exception:
+        company = None
     if not company:
         return {"company_name": "Unknown", "slug": "unknown"}
 
-    slug = company[0]
-    company_name = company[1]
+    slug = company["slug"]
+    company_name = company["name"]
 
     branding = {
         "company_name": company_name,
@@ -375,58 +431,65 @@ def call_agent(kernel: str, user_message: str, context: str = "") -> dict:
 # ============================================================
 
 @app.post("/auth/login")
-async def login(req: LoginRequest, db: Session = Depends(get_db)):
-    result = db.execute(text("""
-        SELECT u.id, u.password_hash, u.company_id, u.role, c.name
-        FROM cal.users u JOIN cal.companies c ON u.company_id = c.id
-        WHERE u.email = :email AND u.is_active = true
-    """), {"email": req.email})
-    user = result.fetchone()
+async def login(req: LoginRequest):
+    # Fetch user via REST
+    users = sb_get("users", {
+        "select": "id,password_hash,company_id,role",
+        "email": f"eq.{req.email}",
+        "is_active": "eq.true",
+    })
+    if not users:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    user = users[0]
 
-    if not user or not pwd_context.verify(req.password, user[1]):
+    if not pwd_context.verify(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    # Get company name
+    companies = sb_get("companies", {"select": "name", "id": f"eq.{user['company_id']}"})
+    company_name = companies[0]["name"] if companies else "Unknown"
+
     # Update last login
-    db.execute(text("UPDATE cal.users SET last_login_at = NOW() WHERE id = :uid"), {"uid": user[0]})
-    db.commit()
+    try:
+        sb_patch("users", {"id": f"eq.{user['id']}"}, {"last_login_at": datetime.utcnow().isoformat()})
+    except Exception:
+        pass
 
     token = jwt.encode({
-        "user_id": user[0],
-        "company_id": user[2],
-        "role": user[3],
+        "user_id": user["id"],
+        "company_id": user["company_id"],
+        "role": user["role"],
         "exp": datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS),
     }, SECRET_KEY, algorithm=ALGORITHM)
 
     return {
         "token": token,
-        "company_name": user[4],
-        "role": user[3],
+        "company_name": company_name,
+        "role": user["role"],
     }
 
 @app.post("/auth/register")
-async def register(req: RegisterRequest, db: Session = Depends(get_db)):
-    # Look up company by slug
-    result = db.execute(text(
-        "SELECT id FROM cal.companies WHERE slug = :slug AND is_active = true"
-    ), {"slug": req.company_code})
-    company = result.fetchone()
-    if not company:
+async def register(req: RegisterRequest):
+    # Look up company by slug via REST
+    companies = sb_get("companies", {"select": "id", "slug": f"eq.{req.company_code}", "is_active": "eq.true"})
+    if not companies:
         raise HTTPException(status_code=404, detail="Invalid registration code")
+    company_id = companies[0]["id"]
 
     # Check email not taken
-    result = db.execute(text("SELECT id FROM cal.users WHERE email = :email"), {"email": req.email})
-    if result.fetchone():
+    existing = sb_get("users", {"select": "id", "email": f"eq.{req.email}"})
+    if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
     password_hash = pwd_context.hash(req.password)
-    db.execute(text("""
-        INSERT INTO cal.users (id, company_id, email, password_hash, first_name, last_name, role)
-        VALUES (nextval('cal.users_id_seq'), :cid, :email, :hash, :fname, :lname, 'user')
-    """), {
-        "cid": company[0], "email": req.email, "hash": password_hash,
-        "fname": req.first_name, "lname": req.last_name,
+    sb_post("users", {
+        "company_id": company_id,
+        "email": req.email,
+        "password_hash": password_hash,
+        "first_name": req.first_name,
+        "last_name": req.last_name,
+        "role": "user",
     })
-    db.commit()
 
     return {"status": "success", "message": "User created. Please login."}
 
@@ -438,7 +501,6 @@ async def register(req: RegisterRequest, db: Session = Depends(get_db)):
 async def upload_cert(
     file: UploadFile = File(...),
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     company_id = auth["company_id"]
 
@@ -452,7 +514,7 @@ async def upload_cert(
     file_path.write_bytes(content)
 
     # Load kernel and extract data
-    kernel = load_tenant_kernel(db, company_id)
+    kernel = load_tenant_kernel(None, company_id)
     prompt = f"""Extract calibration data from this uploaded certificate.
 Filename: {file.filename}
 File size: {len(content)} bytes
@@ -480,63 +542,49 @@ Return ONLY a valid JSON object:
         else:
             return {"status": "error", "message": "Could not parse certificate data. Please enter manually."}
 
-    # Look up tool
-    result = db.execute(text("""
-        SELECT id FROM cal.tools
-        WHERE company_id = :cid AND number = :num
-    """), {"cid": company_id, "num": data.get("tool_number", "")})
-    tool = result.fetchone()
+    # Look up tool via REST
+    tools = sb_get("tools", {
+        "select": "id",
+        "company_id": f"eq.{company_id}",
+        "number": f"eq.{data.get('tool_number', '')}",
+    })
 
-    if not tool:
+    if not tools:
         return {
             "status": "warning",
             "message": f"Tool '{data.get('tool_number')}' not found in registry. Please add it first.",
             "extracted_data": data,
         }
 
-    # Insert calibration record
-    db.execute(text("""
-        INSERT INTO cal.calibrations
-        (id, record_number, tool_id, calibration_date, result, next_due_date, technician, comments)
-        VALUES (nextval('cal.calibrations_id_seq'), :rnum, :tid, :cal_date, :result, :next_due, :tech, :comments)
-    """), {
-        "rnum": f"CAL-{datetime.utcnow().strftime('%Y%m%d')}-{tool[0]}",
-        "tid": tool[0],
-        "cal_date": data.get("calibration_date"),
+    tool_id = tools[0]["id"]
+
+    # Insert calibration record via REST
+    cal_record = sb_post("calibrations", {
+        "record_number": f"CAL-{datetime.utcnow().strftime('%Y%m%d')}-{tool_id}",
+        "tool_id": tool_id,
+        "calibration_date": data.get("calibration_date"),
         "result": data.get("result", "pass"),
-        "next_due": data.get("next_due_date"),
-        "tech": data.get("technician", ""),
+        "next_due_date": data.get("next_due_date"),
+        "technician": data.get("technician", ""),
         "comments": data.get("comments", ""),
     })
 
-    # Insert attachment record
-    db.execute(text("""
-        INSERT INTO cal.attachments
-        (id, tool_id, calibration_id, filename, original_name, file_size, mime_type)
-        VALUES (nextval('cal.attachments_id_seq'), :tid,
-                currval('cal.calibrations_id_seq'), :fname, :oname, :fsize, :mime)
-    """), {
-        "tid": tool[0],
-        "fname": f"{file_id}_{file.filename}",
-        "oname": file.filename,
-        "fsize": len(content),
-        "mime": file.content_type or "application/octet-stream",
+    # Insert attachment record via REST
+    sb_post("attachments", {
+        "tool_id": tool_id,
+        "calibration_id": cal_record.get("id"),
+        "filename": f"{file_id}_{file.filename}",
+        "original_name": file.filename,
+        "file_size": len(content),
+        "mime_type": file.content_type or "application/octet-stream",
     })
 
-    # Update tool's last calibration date
-    db.execute(text("""
-        UPDATE cal.tools
-        SET last_calibration_date = :cal_date,
-            next_due_date = :next_due,
-            calibration_status = 'current'
-        WHERE id = :tid
-    """), {
-        "cal_date": data.get("calibration_date"),
-        "next_due": data.get("next_due_date"),
-        "tid": tool[0],
+    # Update tool's last calibration date via REST
+    sb_patch("tools", {"id": f"eq.{tool_id}"}, {
+        "last_calibration_date": data.get("calibration_date"),
+        "next_due_date": data.get("next_due_date"),
+        "calibration_status": "current",
     })
-
-    db.commit()
 
     return {
         "status": "success",
@@ -589,9 +637,8 @@ CAL_SQL_TOOL = {
 }
 
 
-def execute_safe_sql(db: Session, sql: str, company_id: int) -> str:
-    """Execute a read-only SQL query with company_id bound, return formatted results."""
-    # Safety: only allow SELECT
+def execute_safe_sql(db, sql: str, company_id: int) -> str:
+    """Execute a read-only SQL query via Supabase RPC, return formatted results."""
     stripped = sql.strip().upper()
     if not stripped.startswith("SELECT"):
         return "ERROR: Only SELECT queries are allowed."
@@ -600,22 +647,17 @@ def execute_safe_sql(db: Session, sql: str, company_id: int) -> str:
             return f"ERROR: {forbidden} operations are not allowed."
 
     try:
-        result = db.execute(text(sql), {"cid": company_id})
-        rows = result.fetchall()
-        columns = list(result.keys()) if rows else []
-
+        rows = sb_rpc("execute_readonly_sql", {"query": sql, "company_id": company_id})
         if not rows:
             return "No results found."
 
-        # Format as readable table
+        columns = list(rows[0].keys())
         lines = [" | ".join(columns)]
         lines.append("-" * len(lines[0]))
-        for row in rows[:50]:  # Cap at 50 rows
-            lines.append(" | ".join(str(v) if v is not None else "" for v in row))
-
+        for row in rows[:50]:
+            lines.append(" | ".join(str(row.get(c, "") or "") for c in columns))
         if len(rows) > 50:
             lines.append(f"... ({len(rows)} total rows, showing first 50)")
-
         return "\n".join(lines)
     except Exception as e:
         return f"SQL error: {str(e)}"
@@ -625,26 +667,26 @@ def execute_safe_sql(db: Session, sql: str, company_id: int) -> str:
 async def ask_question(
     req: QuestionRequest,
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     company_id = auth["company_id"]
 
     # Load kernels
-    kernel = load_tenant_kernel(db, company_id)
+    kernel = load_tenant_kernel(None, company_id)
 
     # Load FAQ knowledge base
     faq_path = Path("/app/kernels/cal-faq.md")
     faq_knowledge = faq_path.read_text() if faq_path.exists() else ""
 
-    # Load conversation memory for this company
+    # Load conversation memory for this company via REST
     try:
-        mem_result = db.execute(text("""
-            SELECT question, answer, feedback FROM cal.conversation_memory
-            WHERE company_id = :cid ORDER BY used_count DESC, created_at DESC LIMIT 20
-        """), {"cid": company_id})
-        memories = mem_result.fetchall()
+        memories = sb_get("conversation_memory", {
+            "select": "question,answer,feedback",
+            "company_id": f"eq.{company_id}",
+            "order": "used_count.desc,created_at.desc",
+            "limit": "20",
+        })
         memory_context = "\n".join([
-            f"Previous Q: {m[0]}\nA: {m[1]}" + (f" (feedback: {m[2]})" if m[2] else "")
+            f"Previous Q: {m['question']}\nA: {m['answer']}" + (f" (feedback: {m['feedback']})" if m.get('feedback') else "")
             for m in memories
         ]) if memories else ""
     except Exception:
@@ -702,7 +744,7 @@ INSTRUCTIONS:
         tool_results = []
         for tc in tool_calls:
             if tc.name == "query_calibration_db":
-                sql_result = execute_safe_sql(db, tc.input.get("sql", ""), company_id)
+                sql_result = execute_safe_sql(None, tc.input.get("sql", ""), company_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tc.id,
@@ -711,41 +753,33 @@ INSTRUCTIONS:
 
         messages.append({"role": "user", "content": tool_results})
 
-    # Store Q&A in conversation memory for learning
+    # Store Q&A in conversation memory for learning via REST
     try:
-        db.execute(text("""
-            INSERT INTO cal.conversation_memory (company_id, question, answer)
-            VALUES (:cid, :q, :a)
-            ON CONFLICT (company_id, question_hash)
-            DO UPDATE SET used_count = cal.conversation_memory.used_count + 1,
-                         last_used_at = NOW(),
-                         answer = EXCLUDED.answer
-        """), {"cid": company_id, "q": req.question, "a": final_text[:2000]})
-        db.commit()
+        # Try upsert via RPC (handles ON CONFLICT logic)
+        sb_rpc("upsert_conversation_memory", {
+            "p_company_id": company_id,
+            "p_question": req.question,
+            "p_answer": final_text[:2000],
+        })
     except Exception:
-        db.rollback()
+        pass
 
-    db.commit()
     return {"status": "success", "answer": final_text}
 
 @app.post("/cal/upload-logo")
 async def upload_logo(
     file: UploadFile = File(...),
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     """Upload tenant logo for branded reports."""
     if auth["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
 
-    result = db.execute(text(
-        "SELECT slug FROM cal.companies WHERE id = :cid"
-    ), {"cid": auth["company_id"]})
-    company = result.fetchone()
-    if not company:
+    companies = sb_get("companies", {"select": "slug", "id": f"eq.{auth['company_id']}"})
+    if not companies:
         raise HTTPException(status_code=404, detail="Company not found")
 
-    slug = company[0]
+    slug = companies[0]["slug"]
     logo_dir = Path(f"/app/uploads/tenants/{slug}")
     logo_dir.mkdir(parents=True, exist_ok=True)
 
@@ -768,43 +802,37 @@ async def upload_logo(
 async def generate_evidence(
     req: DownloadRequest,
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     from fastapi.responses import Response
     company_id = auth["company_id"]
 
-    # Build query based on evidence type
-    where_extra = ""
+    # Fetch tools via REST
+    params = {
+        "select": "number,type,manufacturer,serial_number,last_calibration_date,next_due_date,calibration_status,location",
+        "company_id": f"eq.{company_id}",
+        "order": "type,number",
+    }
     if req.evidence_type == "overdue":
-        where_extra = "AND t.calibration_status = 'overdue'"
+        params["calibration_status"] = "eq.overdue"
     elif req.evidence_type == "expiring_soon":
-        where_extra = "AND t.calibration_status = 'expiring_soon'"
+        params["calibration_status"] = "eq.expiring_soon"
 
-    result = db.execute(text(f"""
-        SELECT t.number, t.type, t.manufacturer, t.serial_number,
-               t.last_calibration_date, t.next_due_date, t.calibration_status,
-               t.location, c.result
-        FROM cal.tools t
-        LEFT JOIN LATERAL (
-            SELECT result FROM cal.calibrations
-            WHERE tool_id = t.id ORDER BY calibration_date DESC LIMIT 1
-        ) c ON true
-        WHERE t.company_id = :cid {where_extra}
-        ORDER BY t.type, t.number
-    """), {"cid": company_id})
-    rows = result.fetchall()
+    tools = sb_get("tools", params)
 
     records = [
         {
-            "number": r[0], "type": r[1], "manufacturer": r[2],
-            "serial_number": r[3], "last_calibration_date": str(r[4]) if r[4] else "",
-            "next_due_date": str(r[5]) if r[5] else "", "calibration_status": r[6] or "",
-            "location": r[7] or "", "result": r[8] or "",
+            "number": t.get("number", ""), "type": t.get("type", ""),
+            "manufacturer": t.get("manufacturer", ""),
+            "serial_number": t.get("serial_number", ""),
+            "last_calibration_date": str(t["last_calibration_date"]) if t.get("last_calibration_date") else "",
+            "next_due_date": str(t["next_due_date"]) if t.get("next_due_date") else "",
+            "calibration_status": t.get("calibration_status", ""),
+            "location": t.get("location", ""), "result": "",
         }
-        for r in rows
+        for t in tools
     ]
 
-    kernel = load_tenant_kernel(db, company_id)
+    kernel = load_tenant_kernel(None, company_id)
     prompt = f"""Generate an audit evidence package summary for these calibration records.
 Include:
 - Executive summary of calibration program health
@@ -821,10 +849,9 @@ Records:
     ])
 
     agent_response = call_agent(kernel, prompt)
-    db.commit()
 
     if req.format == "pdf":
-        branding = load_tenant_branding(db, company_id)
+        branding = load_tenant_branding(company_id)
         pdf_bytes = generate_branded_pdf(branding, records, req.evidence_type, agent_response["text"])
         filename = f"cal_evidence_{req.evidence_type}_{datetime.utcnow().strftime('%Y%m%d')}.pdf"
         return Response(
@@ -847,58 +874,53 @@ Records:
 @app.get("/cal/equipment")
 async def list_equipment(
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     company_id = auth["company_id"]
 
-    result = db.execute(text("""
-        SELECT t.id, t.number, t.type, t.description, t.manufacturer,
-               t.model, t.serial_number, t.location, t.building,
-               t.frequency, t.ownership, t.calibration_status, t.tool_status,
-               t.last_calibration_date, t.next_due_date
-        FROM cal.tools t
-        WHERE t.company_id = :cid
-        ORDER BY t.type, t.number
-    """), {"cid": company_id})
+    tools = sb_get("tools", {
+        "select": "id,number,type,description,manufacturer,model,serial_number,location,building,frequency,ownership,calibration_status,tool_status,last_calibration_date,next_due_date",
+        "company_id": f"eq.{company_id}",
+        "order": "type,number",
+    })
 
-    rows = result.fetchall()
     return {
         "equipment": [
             {
-                "id": r[0], "number": r[1], "type": r[2],
-                "description": r[3], "manufacturer": r[4], "model": r[5],
-                "serial_number": r[6], "location": r[7], "building": r[8],
-                "frequency": r[9], "ownership": r[10],
-                "calibration_status": r[11], "tool_status": r[12],
-                "last_cal_date": str(r[13]) if r[13] else None,
-                "next_due_date": str(r[14]) if r[14] else None,
+                "id": t["id"], "number": t["number"], "type": t.get("type", ""),
+                "description": t.get("description", ""), "manufacturer": t.get("manufacturer", ""),
+                "model": t.get("model", ""), "serial_number": t.get("serial_number", ""),
+                "location": t.get("location", ""), "building": t.get("building", ""),
+                "frequency": t.get("frequency", ""), "ownership": t.get("ownership", ""),
+                "calibration_status": t.get("calibration_status", ""),
+                "tool_status": t.get("tool_status", ""),
+                "last_cal_date": str(t["last_calibration_date"]) if t.get("last_calibration_date") else None,
+                "next_due_date": str(t["next_due_date"]) if t.get("next_due_date") else None,
             }
-            for r in rows
+            for t in tools
         ],
-        "total": len(rows),
+        "total": len(tools),
     }
 
 @app.post("/cal/equipment")
 async def add_equipment(
     eq: EquipmentCreate,
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     company_id = auth["company_id"]
 
-    db.execute(text("""
-        INSERT INTO cal.tools
-        (id, company_id, number, type, description, manufacturer,
-         model, serial_number, location, building, frequency, ownership)
-        VALUES (nextval('cal.tools_id_seq'), :cid, :num, :type, :desc, :mfr,
-                :model, :sn, :loc, :bldg, :freq, :own)
-    """), {
-        "cid": company_id, "num": eq.number, "type": eq.type,
-        "desc": eq.description, "mfr": eq.manufacturer, "model": eq.model,
-        "sn": eq.serial_number, "loc": eq.location, "bldg": eq.building,
-        "freq": eq.frequency, "own": eq.ownership,
+    sb_post("tools", {
+        "company_id": company_id,
+        "number": eq.number,
+        "type": eq.type,
+        "description": eq.description,
+        "manufacturer": eq.manufacturer,
+        "model": eq.model,
+        "serial_number": eq.serial_number,
+        "location": eq.location,
+        "building": eq.building,
+        "frequency": eq.frequency,
+        "ownership": eq.ownership,
     })
-    db.commit()
 
     return {"status": "success", "message": f"Tool {eq.number} added."}
 
@@ -909,58 +931,69 @@ async def add_equipment(
 @app.get("/cal/dashboard")
 async def dashboard(
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     company_id = auth["company_id"]
 
-    tool_count = db.execute(text(
-        "SELECT COUNT(*) FROM cal.tools WHERE company_id = :cid"
-    ), {"cid": company_id}).scalar()
+    # Get all tools for this company
+    all_tools = sb_get("tools", {
+        "select": "id,number,type,manufacturer,calibration_status,next_due_date",
+        "company_id": f"eq.{company_id}",
+        "order": "next_due_date.asc.nullslast",
+    })
 
-    status_counts = db.execute(text("""
-        SELECT calibration_status, COUNT(*) FROM cal.tools
-        WHERE company_id = :cid GROUP BY calibration_status
-    """), {"cid": company_id}).fetchall()
+    tool_count = len(all_tools)
 
-    cal_count = db.execute(text("""
-        SELECT COUNT(*) FROM cal.calibrations c
-        JOIN cal.tools t ON c.tool_id = t.id
-        WHERE t.company_id = :cid
-    """), {"cid": company_id}).scalar()
+    # Count by status
+    status_counts = {}
+    for t in all_tools:
+        s = t.get("calibration_status") or "unknown"
+        status_counts[s] = status_counts.get(s, 0) + 1
 
-    upcoming = db.execute(text("""
-        SELECT t.number, t.type, t.manufacturer,
-               t.next_due_date, t.calibration_status
-        FROM cal.tools t
-        WHERE t.company_id = :cid
-          AND t.next_due_date <= CURRENT_DATE + INTERVAL '60 days'
-          AND t.next_due_date >= CURRENT_DATE
-        ORDER BY t.next_due_date ASC
-    """), {"cid": company_id}).fetchall()
+    # Categorize by date
+    from datetime import date
+    today = date.today()
+    upcoming = []
+    overdue_list = []
+    for t in all_tools:
+        ndd = t.get("next_due_date")
+        if not ndd:
+            if t.get("calibration_status") == "overdue":
+                overdue_list.append(t)
+            continue
+        try:
+            due = date.fromisoformat(str(ndd)[:10])
+            days_until = (due - today).days
+        except (ValueError, TypeError):
+            continue
+        if days_until < 0 or t.get("calibration_status") == "overdue":
+            overdue_list.append(t)
+        elif days_until <= 60:
+            upcoming.append(t)
 
-    overdue = db.execute(text("""
-        SELECT t.number, t.type, t.manufacturer,
-               t.next_due_date, t.calibration_status
-        FROM cal.tools t
-        WHERE t.company_id = :cid
-          AND (t.calibration_status = 'overdue'
-               OR (t.next_due_date IS NOT NULL AND t.next_due_date < CURRENT_DATE))
-        ORDER BY t.next_due_date ASC
-    """), {"cid": company_id}).fetchall()
+    # Calibration count via RPC (needs a count query)
+    try:
+        cal_result = sb_rpc("execute_readonly_sql", {
+            "query": f"SELECT COUNT(*) as cnt FROM cal.calibrations c JOIN cal.tools t ON c.tool_id = t.id WHERE t.company_id = :cid",
+            "company_id": company_id,
+        })
+        cal_count = cal_result[0]["cnt"] if cal_result else 0
+    except Exception:
+        cal_count = 0
 
     return {
         "tool_count": tool_count,
         "calibration_count": cal_count,
-        "status_summary": {r[0]: r[1] for r in status_counts if r[0]},
+        "status_summary": status_counts,
         "upcoming_expirations": [
-            {"number": r[0], "type": r[1], "manufacturer": r[2],
-             "next_due_date": str(r[3]), "status": r[4]}
-            for r in upcoming
+            {"number": t["number"], "type": t.get("type", ""), "manufacturer": t.get("manufacturer", ""),
+             "next_due_date": str(t["next_due_date"]), "status": t.get("calibration_status", "")}
+            for t in upcoming
         ],
         "overdue": [
-            {"number": r[0], "type": r[1], "manufacturer": r[2],
-             "next_due_date": str(r[3]) if r[3] else None, "status": r[4]}
-            for r in overdue
+            {"number": t["number"], "type": t.get("type", ""), "manufacturer": t.get("manufacturer", ""),
+             "next_due_date": str(t["next_due_date"]) if t.get("next_due_date") else None,
+             "status": t.get("calibration_status", "")}
+            for t in overdue_list
         ],
     }
 
@@ -973,7 +1006,7 @@ async def health():
     return {
         "status": "healthy",
         "product": "cal.gp3.app",
-        "version": "2.1.0",
+        "version": "2.3.0",
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -1040,24 +1073,22 @@ async def push_agent_event(agent_id: str, event: dict):
 @app.post("/api/proactive/check")
 async def check_proactive(
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     """Check for conditions that should trigger avatar walk-up."""
     company_id = auth["company_id"]
 
-    result = db.execute(text("""
-        SELECT t.number, t.type, t.next_due_date
-        FROM cal.tools t
-        WHERE t.company_id = :cid
-          AND (t.calibration_status = 'overdue'
-               OR (t.next_due_date IS NOT NULL AND t.next_due_date < CURRENT_DATE))
-        ORDER BY t.next_due_date ASC LIMIT 5
-    """), {"cid": company_id})
-    overdue = result.fetchall()
+    overdue_tools = sb_get("tools", {
+        "select": "number,type,next_due_date",
+        "company_id": f"eq.{company_id}",
+        "calibration_status": "eq.overdue",
+        "order": "next_due_date.asc",
+        "limit": "5",
+    })
+    overdue = overdue_tools
 
     alerts_sent = 0
     if overdue:
-        tool_list = ", ".join([f"{r[0]} ({r[1]})" for r in overdue[:3]])
+        tool_list = ", ".join([f"{r['number']} ({r.get('type','')})" for r in overdue[:3]])
         message = (
             f"Hey, I need your attention. We have {len(overdue)} overdue calibrations. "
             f"The most urgent ones are: {tool_list}. "
@@ -1102,7 +1133,7 @@ def extract_tenant_from_email(to_address: str) -> str | None:
     return match.group(1) if match else None
 
 @app.post("/api/email/ingest")
-async def ingest_email(payload: EmailWebhook, db: Session = Depends(get_db)):
+async def ingest_email(payload: EmailWebhook):
     """Receive inbound email for Cal agent.
     Called by email webhook (Cloudflare Email Workers / Mailgun).
     No JWT auth — secured by webhook secret.
@@ -1116,56 +1147,38 @@ async def ingest_email(payload: EmailWebhook, db: Session = Depends(get_db)):
     if not tenant_slug:
         return {"status": "ignored", "reason": f"Unrecognized recipient: {payload.to_address}"}
 
-    # Look up company
-    result = db.execute(text(
-        "SELECT id FROM cal.companies WHERE slug = :slug AND is_active = true"
-    ), {"slug": tenant_slug})
-    company = result.fetchone()
-    if not company:
+    # Look up company via REST
+    companies = sb_get("companies", {"select": "id", "slug": f"eq.{tenant_slug}", "is_active": "eq.true"})
+    if not companies:
         return {"status": "ignored", "reason": f"Unknown tenant: {tenant_slug}"}
 
-    company_id = company[0]
+    company_id = companies[0]["id"]
 
-    # Dedup check by Message-ID
+    # Dedup check by Message-ID via REST
     if payload.message_id:
-        existing = db.execute(text(
-            "SELECT id FROM cal.email_log WHERE message_id = :mid"
-        ), {"mid": payload.message_id}).fetchone()
+        existing = sb_get("email_log", {"select": "id", "message_id": f"eq.{payload.message_id}"})
         if existing:
-            return {"status": "duplicate", "email_log_id": existing[0]}
+            return {"status": "duplicate", "email_log_id": existing[0]["id"]}
 
-    # Log the email
-    db.execute(text("""
-        INSERT INTO cal.email_log
-        (company_id, direction, from_address, to_address, cc_addresses,
-         subject, body_text, body_html, has_attachments, attachment_count,
-         message_id, in_reply_to, status)
-        VALUES (:cid, 'inbound', :from_addr, :to_addr, :cc,
-                :subject, :body_text, :body_html, :has_att, :att_count,
-                :mid, :irt, 'received')
-    """), {
-        "cid": company_id,
-        "from_addr": payload.from_address,
-        "to_addr": payload.to_address,
-        "cc": payload.cc,
+    # Log the email via REST
+    email_record = sb_post("email_log", {
+        "company_id": company_id,
+        "direction": "inbound",
+        "from_address": payload.from_address,
+        "to_address": payload.to_address,
+        "cc_addresses": payload.cc,
         "subject": payload.subject,
         "body_text": payload.body_text,
         "body_html": payload.body_html,
-        "has_att": len(payload.attachments) > 0,
-        "att_count": len(payload.attachments),
-        "mid": payload.message_id or None,
-        "irt": payload.in_reply_to or None,
+        "has_attachments": len(payload.attachments) > 0,
+        "attachment_count": len(payload.attachments),
+        "message_id": payload.message_id or None,
+        "in_reply_to": payload.in_reply_to or None,
+        "status": "received",
     })
-    db.commit()
-
-    # Get the email_log ID
-    log_id = db.execute(text(
-        "SELECT id FROM cal.email_log WHERE message_id = :mid ORDER BY id DESC LIMIT 1"
-    ), {"mid": payload.message_id or f"noid-{datetime.utcnow().isoformat()}"}).fetchone()
-    email_log_id = log_id[0] if log_id else None
+    email_log_id = email_record.get("id") if email_record else None
 
     # --- CLASSIFY AND PROCESS ---
-    # Use Claude to understand what this email is about
     context = f"""Inbound email to calibration agent:
 From: {payload.from_address}
 Subject: {payload.subject}
@@ -1183,19 +1196,18 @@ Attachments: {len(payload.attachments)} files ({', '.join(a.get('filename','?') 
 Return ONLY a JSON object: {"category": "CATEGORY", "summary": "1-sentence summary", "tool_numbers": ["CAL-XXXX"] or [], "action": "suggested next action"}"""
 
     try:
-        kernel = load_tenant_kernel(db, company_id)
+        kernel = load_tenant_kernel(None, company_id)
         classification = call_agent(kernel, classification_prompt, context)
         result_data = json.loads(classification["text"]) if classification["text"].strip().startswith("{") else {"category": "OTHER", "summary": classification["text"][:200]}
     except Exception:
         result_data = {"category": "OTHER", "summary": "Could not classify", "error": True}
 
-    # Update email log with classification
-    db.execute(text("""
-        UPDATE cal.email_log
-        SET status = 'processed', processing_result = :result, processed_at = NOW()
-        WHERE id = :eid
-    """), {"result": json.dumps(result_data), "eid": email_log_id})
-    db.commit()
+    # Update email log with classification via REST
+    if email_log_id:
+        sb_patch("email_log", {"id": f"eq.{email_log_id}"}, {
+            "status": "processed",
+            "processing_result": json.dumps(result_data),
+        })
 
     # --- ACT ON CLASSIFICATION ---
     actions_taken = []
@@ -1234,7 +1246,6 @@ Return ONLY a JSON object: {"category": "CATEGORY", "summary": "1-sentence summa
 async def send_email(
     req: dict,
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
 ):
     """Cal sends an outbound email from cal@{tenant}.gp3.app.
     Uses Mailgun or SMTP relay configured via env vars.
@@ -1243,15 +1254,12 @@ async def send_email(
 
     company_id = auth["company_id"]
 
-    # Get company slug for sender address
-    result = db.execute(text(
-        "SELECT slug, name FROM cal.companies WHERE id = :cid"
-    ), {"cid": company_id})
-    company = result.fetchone()
-    if not company:
+    # Get company slug for sender address via REST
+    companies = sb_get("companies", {"select": "slug,name", "id": f"eq.{company_id}"})
+    if not companies:
         raise HTTPException(status_code=404, detail="Company not found")
 
-    slug, company_name = company[0], company[1]
+    slug, company_name = companies[0]["slug"], companies[0]["name"]
     sender = f"Cal - {company_name} <cal@{slug}.gp3.app>"
     to_address = req.get("to", "")
     subject = req.get("subject", "")
@@ -1285,24 +1293,21 @@ async def send_email(
             timeout=15.0,
         )
 
-    # Log the outbound email
-    db.execute(text("""
-        INSERT INTO cal.email_log
-        (company_id, direction, from_address, to_address, cc_addresses,
-         subject, body_text, status, message_id)
-        VALUES (:cid, 'outbound', :from_addr, :to_addr, :cc,
-                :subject, :body, :status, :mid)
-    """), {
-        "cid": company_id,
-        "from_addr": sender,
-        "to_addr": to_address,
-        "cc": cc,
-        "subject": subject,
-        "body": body,
-        "status": "sent" if resp.status_code == 200 else "failed",
-        "mid": resp.json().get("id", "") if resp.status_code == 200 else None,
-    })
-    db.commit()
+    # Log the outbound email via REST
+    try:
+        sb_post("email_log", {
+            "company_id": company_id,
+            "direction": "outbound",
+            "from_address": sender,
+            "to_address": to_address,
+            "cc_addresses": cc,
+            "subject": subject,
+            "body_text": body,
+            "status": "sent" if resp.status_code == 200 else "failed",
+            "message_id": resp.json().get("id", "") if resp.status_code == 200 else None,
+        })
+    except Exception:
+        pass
 
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Email send failed: {resp.text}")
@@ -1312,30 +1317,28 @@ async def send_email(
 @app.get("/api/email/log")
 async def get_email_log(
     auth: dict = Depends(verify_token),
-    db: Session = Depends(get_db),
     limit: int = 50,
 ):
     """List recent emails for the tenant."""
     company_id = auth["company_id"]
-    result = db.execute(text("""
-        SELECT id, direction, from_address, to_address, subject,
-               status, processing_result, has_attachments,
-               received_at, processed_at
-        FROM cal.email_log
-        WHERE company_id = :cid
-        ORDER BY received_at DESC
-        LIMIT :lim
-    """), {"cid": company_id, "lim": limit})
+    emails = sb_get("email_log", {
+        "select": "id,direction,from_address,to_address,subject,status,processing_result,has_attachments,received_at,processed_at",
+        "company_id": f"eq.{company_id}",
+        "order": "received_at.desc",
+        "limit": str(limit),
+    })
 
     return {
         "emails": [
             {
-                "id": r[0], "direction": r[1], "from": r[2], "to": r[3],
-                "subject": r[4], "status": r[5],
-                "classification": r[6], "has_attachments": r[7],
-                "received_at": str(r[8]) if r[8] else None,
-                "processed_at": str(r[9]) if r[9] else None,
+                "id": e["id"], "direction": e.get("direction", ""),
+                "from": e.get("from_address", ""), "to": e.get("to_address", ""),
+                "subject": e.get("subject", ""), "status": e.get("status", ""),
+                "classification": e.get("processing_result", ""),
+                "has_attachments": e.get("has_attachments", False),
+                "received_at": str(e["received_at"]) if e.get("received_at") else None,
+                "processed_at": str(e["processed_at"]) if e.get("processed_at") else None,
             }
-            for r in result.fetchall()
+            for e in emails
         ],
     }
