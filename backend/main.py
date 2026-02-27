@@ -544,6 +544,83 @@ Return ONLY a valid JSON object:
         "data": data,
     }
 
+# Schema reference for Claude's SQL tool
+CAL_SCHEMA_REF = """
+Available tables (all in cal schema, always filter by company_id = :cid):
+
+cal.tools — Equipment registry
+  id, company_id, number, serial_number, manufacturer, model, description,
+  type, frequency, calibration_status, tool_status, location, building,
+  ownership, last_calibration_date, next_due_date
+
+cal.calibrations — Calibration records
+  id, record_number, tool_id (FK→tools.id), calibration_date, result,
+  next_due_date, technician, comments
+
+cal.attachments — Uploaded certificates
+  id, tool_id, calibration_id, filename, original_name, file_size, mime_type, uploaded_at
+
+cal.email_log — Inbound/outbound email tracking
+  id, company_id, direction, from_address, to_address, subject, body_text,
+  status, processing_result, tool_id, calibration_id, message_id, received_at
+
+IMPORTANT: Use ILIKE with % wildcards for fuzzy text matching. Always include WHERE company_id = :cid for tools/email_log, or JOIN through tools for calibrations.
+Only SELECT queries allowed. Never UPDATE/DELETE/INSERT.
+"""
+
+# Claude tools definition for SQL lookup
+CAL_SQL_TOOL = {
+    "name": "query_calibration_db",
+    "description": "Run a read-only SQL query against the calibration database to find equipment, calibration records, or email logs. Use ILIKE for fuzzy text matching. Always filter by company_id.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sql": {
+                "type": "string",
+                "description": "A SELECT query against cal.tools, cal.calibrations, cal.attachments, or cal.email_log. Always include company_id filter."
+            },
+            "explanation": {
+                "type": "string",
+                "description": "Brief explanation of what this query looks for"
+            }
+        },
+        "required": ["sql", "explanation"]
+    }
+}
+
+
+def execute_safe_sql(db: Session, sql: str, company_id: int) -> str:
+    """Execute a read-only SQL query with company_id bound, return formatted results."""
+    # Safety: only allow SELECT
+    stripped = sql.strip().upper()
+    if not stripped.startswith("SELECT"):
+        return "ERROR: Only SELECT queries are allowed."
+    for forbidden in ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE"]:
+        if f" {forbidden} " in f" {stripped} " or stripped.startswith(forbidden):
+            return f"ERROR: {forbidden} operations are not allowed."
+
+    try:
+        result = db.execute(text(sql), {"cid": company_id})
+        rows = result.fetchall()
+        columns = list(result.keys()) if rows else []
+
+        if not rows:
+            return "No results found."
+
+        # Format as readable table
+        lines = [" | ".join(columns)]
+        lines.append("-" * len(lines[0]))
+        for row in rows[:50]:  # Cap at 50 rows
+            lines.append(" | ".join(str(v) if v is not None else "" for v in row))
+
+        if len(rows) > 50:
+            lines.append(f"... ({len(rows)} total rows, showing first 50)")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"SQL error: {str(e)}"
+
+
 @app.post("/cal/question")
 async def ask_question(
     req: QuestionRequest,
@@ -552,38 +629,104 @@ async def ask_question(
 ):
     company_id = auth["company_id"]
 
-    # Build context from calibration data
-    result = db.execute(text("""
-        SELECT t.number, t.type, t.manufacturer,
-               c.calibration_date, c.next_due_date, c.technician,
-               t.calibration_status, c.result, c.comments
-        FROM cal.calibrations c
-        JOIN cal.tools t ON c.tool_id = t.id
-        WHERE t.company_id = :cid
-        ORDER BY c.next_due_date ASC
-    """), {"cid": company_id})
-    cal_data = result.fetchall()
-
-    context = "Current calibration records:\n" + "\n".join([
-        f"- {r[0]} ({r[1]}, mfr={r[2]}): Cal {r[3]}, Due {r[4]}, Tech: {r[5]}, Status: {r[6]}, Result: {r[7]}"
-        for r in cal_data
-    ]) if cal_data else "No calibration records on file yet."
-
-    # Get equipment summary
-    result = db.execute(text("""
-        SELECT COUNT(*),
-               COUNT(CASE WHEN calibration_status = 'overdue' THEN 1 END),
-               COUNT(CASE WHEN calibration_status = 'current' THEN 1 END)
-        FROM cal.tools WHERE company_id = :cid
-    """), {"cid": company_id})
-    eq_counts = result.fetchone()
-    context += f"\n\nEquipment summary: {eq_counts[0]} total, {eq_counts[2]} current, {eq_counts[1]} overdue."
-
+    # Load kernels
     kernel = load_tenant_kernel(db, company_id)
-    agent_response = call_agent(kernel, req.question, context)
-    db.commit()
 
-    return {"status": "success", "answer": agent_response["text"]}
+    # Load FAQ knowledge base
+    faq_path = Path("/app/kernels/cal-faq.md")
+    faq_knowledge = faq_path.read_text() if faq_path.exists() else ""
+
+    # Load conversation memory for this company
+    try:
+        mem_result = db.execute(text("""
+            SELECT question, answer, feedback FROM cal.conversation_memory
+            WHERE company_id = :cid ORDER BY used_count DESC, created_at DESC LIMIT 20
+        """), {"cid": company_id})
+        memories = mem_result.fetchall()
+        memory_context = "\n".join([
+            f"Previous Q: {m[0]}\nA: {m[1]}" + (f" (feedback: {m[2]})" if m[2] else "")
+            for m in memories
+        ]) if memories else ""
+    except Exception:
+        memory_context = ""
+
+    system_prompt = f"""{kernel}
+
+---
+{faq_knowledge}
+
+---
+DATABASE SCHEMA:
+{CAL_SCHEMA_REF}
+
+{f"CONVERSATION MEMORY (past interactions with this tenant):{chr(10)}{memory_context}" if memory_context else ""}
+
+INSTRUCTIONS:
+- You are Cal, speaking conversationally in first person. Keep responses concise for voice output.
+- Use the query_calibration_db tool to look up specific data before answering.
+- Use ILIKE with % wildcards for fuzzy matching (e.g., WHERE type ILIKE '%caliper%').
+- If the user asks about specific equipment, search by number, type, manufacturer, or description.
+- Always cite specific data from query results — never make up numbers or dates.
+- If no data is found, say so honestly.
+- Short sentences. This is spoken aloud, not a report.
+"""
+
+    # Call Claude with tool use (agentic loop)
+    messages = [{"role": "user", "content": req.question}]
+    max_turns = 5
+    final_text = ""
+
+    for _ in range(max_turns):
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=2000,
+            system=system_prompt,
+            tools=[CAL_SQL_TOOL],
+            messages=messages,
+        )
+
+        # Process response blocks
+        tool_calls = []
+        for block in response.content:
+            if block.type == "text":
+                final_text += block.text
+            elif block.type == "tool_use":
+                tool_calls.append(block)
+
+        if response.stop_reason == "end_turn" or not tool_calls:
+            break
+
+        # Execute tool calls and feed results back
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_results = []
+        for tc in tool_calls:
+            if tc.name == "query_calibration_db":
+                sql_result = execute_safe_sql(db, tc.input.get("sql", ""), company_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": sql_result,
+                })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    # Store Q&A in conversation memory for learning
+    try:
+        db.execute(text("""
+            INSERT INTO cal.conversation_memory (company_id, question, answer)
+            VALUES (:cid, :q, :a)
+            ON CONFLICT (company_id, question_hash)
+            DO UPDATE SET used_count = cal.conversation_memory.used_count + 1,
+                         last_used_at = NOW(),
+                         answer = EXCLUDED.answer
+        """), {"cid": company_id, "q": req.question, "a": final_text[:2000]})
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    db.commit()
+    return {"status": "success", "answer": final_text}
 
 @app.post("/cal/upload-logo")
 async def upload_logo(
