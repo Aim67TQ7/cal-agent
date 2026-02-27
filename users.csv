@@ -1,0 +1,8 @@
+"id","email","password","first_name","last_name","role","company_id","is_active","last_login_at","created_at","updated_at"
+"1","admin@company.com","$2b$10$pHtnY.ESr7gbvt4v1jt5deUQhJw6H3QV6KiFE1lavCIGr6UfPtj0e","Admin","User","admin",,"true","""2025-06-09T18:20:28.292Z""","""2025-06-09T15:18:40.649Z""","""2025-06-09T15:18:40.649Z"""
+"2","ryanrlinton@gmail.com","$2b$10$Gspa08sd6.jMQTyyaqNzueKWWGy6vq.RUf0rorGNjw6hceLXCgvcO","Ryan","Linton","admin",,"true","""2025-09-04T17:03:37.065Z""","""2025-06-09T15:21:31.774Z""","""2025-06-09T15:21:31.774Z"""
+"3","rlinton@buntingmagnetics.com","$2b$10$9Gqlzzct/LuGYNYyb0olk.6AaN35YDpzvv1VXXoELIIFKfb1L2ATe","Ryan","Linton","company_admin","3","true","""2025-06-21T22:40:31.243Z""","""2025-06-09T15:24:14.679Z""","""2025-06-09T15:24:14.679Z"""
+"4","john.doe@example.com","$2b$10$9tFF2Rwr0k9vpvYkx3GBaux1jqHsFvqeWNbvl.X4Nnvs6yKuorY1i","John","Doe","user","2","true","""2025-06-09T16:37:10.314Z""","""2025-06-09T15:27:48.038Z""","""2025-06-09T15:27:48.038Z"""
+"5","bdick@buntingmagnetics.com","$2b$10$QodtNN4pY9/NrmBvjdwoce7Y6iHEYHzuiU5Yt1HzkC/YmWYFfge8q","Brandon","Dick","company_admin","3","true","""2025-06-24T11:17:17.324Z""","""2025-06-09T15:28:28.369Z""","""2025-06-09T15:28:28.369Z"""
+"6","dsanchez@buntingmagnetics.com","$2b$10$DKdHnGpIVsi9QMcvIBI5iO93utUlsTmAP64PRiGA2VG0ivtKmkaVu","Derek","Sanchez","user","3","true","""2025-08-25T13:56:04.280Z""","""2025-06-09T17:21:11.076Z""","""2025-06-09T17:21:11.076Z"""
+"7","sbryant@buntingmagnetics.com","$2b$10$sPXtRBlNkazyLKTfrMRP/eHWsO3onAfQWyVEWTwvo/F/1oVw9nrwu","Steve","Bryant","user","3","true","""2025-06-09T18:35:55.882Z""","""2025-06-09T17:21:38.577Z""","""2025-06-09T17:21:38.577Z"""

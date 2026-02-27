@@ -1,0 +1,11 @@
+"id","key","value","updated_at","company_id"
+"1","basic_max_users","1","""2025-06-09T16:18:01.165Z""",
+"2","basic_max_tools","50","""2025-06-09T16:18:01.252Z""",
+"3","professional_max_users","5","""2025-06-09T16:18:01.319Z""",
+"4","professional_max_tools","250","""2025-06-09T16:18:01.385Z""",
+"5","enterprise_max_users","20","""2025-06-09T16:18:01.451Z""",
+"6","enterprise_max_tools","1000","""2025-06-09T16:18:01.518Z""",
+"7","alertThreshold","30","""2025-06-09T16:19:21.824Z""",
+"8","notifications","true","""2025-06-09T16:19:21.898Z""",
+"9","emailAlerts","false","""2025-06-09T16:19:21.973Z""",
+"10","defaultFrequency","annual","""2025-06-09T16:19:22.046Z""",

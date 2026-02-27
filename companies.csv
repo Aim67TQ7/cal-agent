@@ -1,0 +1,4 @@
+"id","name","slug","subscription_plan","max_users","max_tools","is_active","created_at","updated_at"
+"1","Default Company","default","premium","20","1000","true","""2025-06-09T15:18:22.033Z""","""2025-06-09T15:18:22.033Z"""
+"2","Demo Company","Demo1","basic","1","12","true","""2025-06-09T15:21:51.966Z""","""2025-06-09T15:21:51.966Z"""
+"3","Bunting Magnetics Company","BMC","professional","5","250","true","""2025-06-09T15:23:16.028Z""","""2025-06-09T15:23:16.028Z"""

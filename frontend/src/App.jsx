@@ -14,23 +14,43 @@ function api(token) {
 // LOGIN
 // ============================================================
 function LoginPage({ onLogin }) {
+  const [mode, setMode] = useState('login') // login | register
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [name, setName] = useState('')
+  const [tenantCode, setTenantCode] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
   const [loading, setLoading] = useState(false)
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setLoading(true)
     setError('')
+    setSuccess('')
     try {
-      const res = await api().post('/auth/login', { email, password })
-      onLogin(res.data)
+      if (mode === 'login') {
+        const res = await api().post('/auth/login', { email, password })
+        onLogin(res.data)
+      } else {
+        await api().post('/auth/register', { email, password, name, tenant_code: tenantCode })
+        setSuccess('Account created! You can now sign in.')
+        setMode('login')
+        setName('')
+        setTenantCode('')
+      }
     } catch (err) {
-      setError(err.response?.data?.detail || 'Login failed')
+      setError(err.response?.data?.detail || (mode === 'login' ? 'Login failed' : 'Registration failed'))
     } finally {
       setLoading(false)
     }
+  }
+
+  const switchMode = () => {
+    setMode(mode === 'login' ? 'register' : 'login')
+    setError('')
+    setSuccess('')
   }
 
   return (
@@ -41,14 +61,57 @@ function LoginPage({ onLogin }) {
           <div style={{ color: 'var(--text-muted)', marginTop: 8, fontSize: 14 }}>Calibration Management Agent</div>
         </div>
         <form onSubmit={handleSubmit} className="card" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>
+            {mode === 'login' ? 'Sign In' : 'Create Account'}
+          </div>
+          {mode === 'register' && (
+            <input type="text" placeholder="Full Name" value={name} onChange={e => setName(e.target.value)} required />
+          )}
           <input type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} required />
-          <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)} required />
+          <div style={{ position: 'relative' }}>
+            <input
+              type={showPassword ? 'text' : 'password'}
+              placeholder="Password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              required
+              style={{ width: '100%', paddingRight: 44 }}
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword(!showPassword)}
+              style={{
+                position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: 'var(--text-muted)', fontSize: 18, padding: '4px 6px',
+                lineHeight: 1,
+              }}
+              title={showPassword ? 'Hide password' : 'Show password'}
+            >
+              {showPassword ? '\u25C9' : '\u25CE'}
+            </button>
+          </div>
+          {mode === 'register' && (
+            <input type="text" placeholder="Organization Code" value={tenantCode} onChange={e => setTenantCode(e.target.value)} required />
+          )}
           {error && <div style={{ color: 'var(--danger)', fontSize: 13 }}>{error}</div>}
+          {success && <div style={{ color: 'var(--success)', fontSize: 13 }}>{success}</div>}
           <button type="submit" disabled={loading} style={{ marginTop: 6 }}>
-            {loading ? 'Signing in...' : 'Sign In'}
+            {loading ? (mode === 'login' ? 'Signing in...' : 'Creating account...') : (mode === 'login' ? 'Sign In' : 'Create Account')}
           </button>
         </form>
-        <div style={{ textAlign: 'center', marginTop: 20, color: 'var(--text-muted)', fontSize: 12 }}>
+        <div style={{ textAlign: 'center', marginTop: 16 }}>
+          <button
+            onClick={switchMode}
+            style={{
+              background: 'none', border: 'none', color: 'var(--accent)',
+              cursor: 'pointer', fontSize: 13, textDecoration: 'underline',
+            }}
+          >
+            {mode === 'login' ? "Don't have an account? Register" : 'Already have an account? Sign In'}
+          </button>
+        </div>
+        <div style={{ textAlign: 'center', marginTop: 12, color: 'var(--text-muted)', fontSize: 12 }}>
           Powered by n0v8v
         </div>
       </div>

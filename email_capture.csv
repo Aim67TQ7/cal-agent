@@ -1,0 +1,2 @@
+"id","email","source","status","subscribed","email_sent","created_at","updated_at"
+"1","test@example.com","landing_page","active","true","true","""2025-06-30T19:02:51.156Z""","""2025-06-30T19:02:51.216Z"""
