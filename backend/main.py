@@ -22,7 +22,7 @@ import json
 app = FastAPI(
     title="cal.gp3.app - Calibration Agent",
     description="Multi-tenant calibration management powered by AI",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -37,7 +37,7 @@ app.add_middleware(
 # CONFIG
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase direct connection string
 SECRET_KEY = os.getenv("SECRET_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
@@ -61,27 +61,28 @@ class LoginRequest(BaseModel):
 class RegisterRequest(BaseModel):
     email: str
     password: str
-    name: str
-    tenant_code: str  # opaque registration code, not slug
+    first_name: str
+    last_name: str = ""
+    company_code: str  # company slug used at registration
 
 class QuestionRequest(BaseModel):
     question: str
 
 class DownloadRequest(BaseModel):
     evidence_type: str = "all_current"
-    format: str = "pdf"  # "pdf" or "text"
+    format: str = "pdf"
 
 class EquipmentCreate(BaseModel):
-    equipment_id: str
-    equipment_type: str = ""
+    number: str
+    type: str = ""
     description: str = ""
     manufacturer: str = ""
     model: str = ""
     serial_number: str = ""
     location: str = ""
-    cal_frequency_months: int = 12
-    lab_name: str = ""
-    critical: bool = False
+    building: str = ""
+    frequency: str = "annual"
+    ownership: str = ""
 
 # ============================================================
 # DEPENDENCIES
@@ -99,74 +100,71 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         return {
             "user_id": payload["user_id"],
-            "tenant_id": payload["tenant_id"],
+            "company_id": payload["company_id"],
             "role": payload.get("role", "user"),
         }
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-def set_tenant_context(db: Session, tenant_id: str):
-    db.execute(text("SET LOCAL app.current_tenant_id = :tid"), {"tid": tenant_id})
-
 # ============================================================
 # KERNEL LOADER
 # ============================================================
 
-def load_tenant_kernel(db: Session, tenant_id: str) -> str:
+def load_tenant_kernel(db: Session, company_id: int) -> str:
     """Load two-layer kernel: agent kernel (shared) + tenant kernel (per-customer)."""
 
-    # Layer 1: Agent kernel — maintained by n0v8v, shared across all tenants
+    # Layer 1: Agent kernel
     agent_kernel_path = Path("/app/kernels/calibrations_v1.0.ttc.md")
     if agent_kernel_path.exists():
         agent_kernel = agent_kernel_path.read_text()
     else:
         agent_kernel = "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
 
-    # Get tenant info
+    # Get company info
     result = db.execute(text(
-        "SELECT company_name, tenant_slug FROM tenants WHERE id = :tid"
-    ), {"tid": tenant_id})
-    tenant = result.fetchone()
-    tenant_name = tenant[0] if tenant else "Unknown"
-    tenant_slug = tenant[1] if tenant else "unknown"
+        "SELECT name, slug FROM cal.companies WHERE id = :cid"
+    ), {"cid": company_id})
+    company = result.fetchone()
+    company_name = company[0] if company else "Unknown"
+    company_slug = company[1] if company else "unknown"
 
     # Get equipment registry
     result = db.execute(text("""
-        SELECT equipment_id, equipment_type, cal_frequency_months, lab_name, critical
-        FROM equipment WHERE tenant_id = :tid ORDER BY equipment_type, equipment_id
-    """), {"tid": tenant_id})
+        SELECT number, type, frequency, ownership, description
+        FROM cal.tools WHERE company_id = :cid ORDER BY type, number
+    """), {"cid": company_id})
     equipment = result.fetchall()
 
     equipment_list = "\n".join([
-        f"  {eq[0]}: type={eq[1]} | freq={eq[2]}mo | lab={eq[3]} | critical={eq[4]}"
+        f"  {eq[0]}: type={eq[1]} | freq={eq[2]} | owner={eq[3]} | {eq[4] or ''}"
         for eq in equipment
     ]) or "  No equipment registered yet."
 
     # Inject variables into agent kernel
-    kernel = agent_kernel.replace("{TENANT_NAME}", tenant_name)
+    kernel = agent_kernel.replace("{TENANT_NAME}", company_name)
     kernel = kernel.replace("{EQUIPMENT_LIST}", equipment_list)
 
     # Layer 2: Tenant kernel — per-customer customizations
-    tenant_kernel_path = Path(f"/app/kernels/tenants/{tenant_slug}.ttc.md")
+    tenant_kernel_path = Path(f"/app/kernels/tenants/{company_slug}.ttc.md")
     if tenant_kernel_path.exists():
         tenant_kernel = tenant_kernel_path.read_text()
-        tenant_kernel = tenant_kernel.replace("{TENANT_NAME}", tenant_name)
+        tenant_kernel = tenant_kernel.replace("{TENANT_NAME}", company_name)
         tenant_kernel = tenant_kernel.replace("{EQUIPMENT_LIST}", equipment_list)
         kernel = kernel + "\n\n---\n\n" + tenant_kernel
 
     return kernel
 
-def load_tenant_branding(db: Session, tenant_id: str) -> dict:
+def load_tenant_branding(db: Session, company_id: int) -> dict:
     """Parse branding block from tenant kernel."""
     result = db.execute(text(
-        "SELECT tenant_slug, company_name FROM tenants WHERE id = :tid"
-    ), {"tid": tenant_id})
-    tenant = result.fetchone()
-    if not tenant:
+        "SELECT slug, name FROM cal.companies WHERE id = :cid"
+    ), {"cid": company_id})
+    company = result.fetchone()
+    if not company:
         return {"company_name": "Unknown", "slug": "unknown"}
 
-    slug = tenant[0]
-    company_name = tenant[1]
+    slug = company[0]
+    company_name = company[1]
 
     branding = {
         "company_name": company_name,
@@ -181,14 +179,12 @@ def load_tenant_branding(db: Session, tenant_id: str) -> dict:
         "report_footer": f"Confidential — {company_name}",
     }
 
-    # Try to read branding from tenant kernel
     tenant_kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
     if not tenant_kernel_path.exists():
         return branding
 
     content = tenant_kernel_path.read_text()
 
-    # Parse branding block
     brand_match = re.search(r'### 品牌标识.*?```(.*?)```', content, re.DOTALL)
     if not brand_match:
         return branding
@@ -246,7 +242,6 @@ def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_s
     accent = HexColor(branding["accent_color"])
     styles = getSampleStyleSheet()
 
-    # Custom styles
     styles.add(ParagraphStyle(
         "BrandTitle", parent=styles["Title"], textColor=primary, fontSize=22, spaceAfter=6
     ))
@@ -273,7 +268,6 @@ def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_s
     elements.append(Paragraph("Calibration Evidence Package", styles["BrandTitle"]))
     elements.append(Paragraph(branding["company_name"], styles["BrandSubtitle"]))
 
-    # Address
     for line in branding.get("address_lines", []):
         elements.append(Paragraph(line, styles["Normal"]))
     if branding.get("phone"):
@@ -285,10 +279,9 @@ def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_s
 
     # Cover stats
     total = len(records)
-    current = sum(1 for r in records if r[6] == "current")
-    overdue = sum(1 for r in records if r[6] == "overdue")
-    expiring = sum(1 for r in records if r[6] == "expiring_soon")
-    critical_count = sum(1 for r in records if r[2])
+    current = sum(1 for r in records if r["calibration_status"] == "current")
+    overdue = sum(1 for r in records if r["calibration_status"] == "overdue")
+    expiring = sum(1 for r in records if r["calibration_status"] == "expiring_soon")
     compliance_rate = f"{(current / total * 100):.1f}%" if total > 0 else "N/A"
 
     cover_data = [
@@ -299,7 +292,6 @@ def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_s
         ["Current", str(current)],
         ["Expiring Soon", str(expiring)],
         ["Overdue", str(overdue)],
-        ["Critical Items", str(critical_count)],
     ]
     cover_table = Table(cover_data, colWidths=[2*inch, 3*inch])
     cover_table.setStyle(TableStyle([
@@ -318,7 +310,6 @@ def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_s
     for para in ai_summary.split("\n\n"):
         clean = para.strip()
         if clean:
-            # Strip markdown bold/headers for PDF
             clean = re.sub(r'[#*]+\s*', '', clean)
             clean = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', clean)
             elements.append(Paragraph(clean, styles["Normal"]))
@@ -329,14 +320,16 @@ def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_s
     # Equipment detail table
     if records:
         elements.append(Paragraph("Calibration Records", styles["SectionHead"]))
-        header = ["Equipment ID", "Type", "Critical", "Cal Date", "Exp Date", "Lab", "Status", "Result"]
+        header = ["Tool #", "Type", "Manufacturer", "Cal Date", "Next Due", "Status", "Result"]
         table_data = [header]
         for r in records:
-            status_display = str(r[6] or "").replace("_", " ").title()
+            status_display = str(r.get("calibration_status") or "").replace("_", " ").title()
             table_data.append([
-                str(r[0]), str(r[1]), "YES" if r[2] else "",
-                str(r[3] or ""), str(r[4] or ""), str(r[5] or ""),
-                status_display, str(r[8] or ""),
+                str(r.get("number", "")), str(r.get("type", "")),
+                str(r.get("manufacturer", "")),
+                str(r.get("last_calibration_date") or ""),
+                str(r.get("next_due_date") or ""),
+                status_display, str(r.get("result") or ""),
             ])
 
         t = Table(table_data, repeatRows=1)
@@ -377,16 +370,6 @@ def call_agent(kernel: str, user_message: str, context: str = "") -> dict:
         "output_tokens": response.usage.output_tokens,
     }
 
-def log_tokens(db: Session, tenant_id: str, user_id: str, request_type: str, agent_response: dict):
-    cost = (agent_response["input_tokens"] * 0.003 / 1000) + (agent_response["output_tokens"] * 0.015 / 1000)
-    db.execute(text("""
-        INSERT INTO token_usage (tenant_id, user_id, request_type, input_tokens, output_tokens, cost)
-        VALUES (:tid, :uid, :rtype, :inp, :out, :cost)
-    """), {
-        "tid": tenant_id, "uid": user_id, "rtype": request_type,
-        "inp": agent_response["input_tokens"], "out": agent_response["output_tokens"], "cost": cost,
-    })
-
 # ============================================================
 # AUTH ENDPOINTS
 # ============================================================
@@ -394,9 +377,9 @@ def log_tokens(db: Session, tenant_id: str, user_id: str, request_type: str, age
 @app.post("/auth/login")
 async def login(req: LoginRequest, db: Session = Depends(get_db)):
     result = db.execute(text("""
-        SELECT u.id, u.password_hash, u.tenant_id, u.role, t.company_name
-        FROM users u JOIN tenants t ON u.tenant_id = t.id
-        WHERE u.email = :email
+        SELECT u.id, u.password_hash, u.company_id, u.role, c.name
+        FROM cal.users u JOIN cal.companies c ON u.company_id = c.id
+        WHERE u.email = :email AND u.is_active = true
     """), {"email": req.email})
     user = result.fetchone()
 
@@ -404,12 +387,12 @@ async def login(req: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     # Update last login
-    db.execute(text("UPDATE users SET last_login = NOW() WHERE id = :uid"), {"uid": user[0]})
+    db.execute(text("UPDATE cal.users SET last_login_at = NOW() WHERE id = :uid"), {"uid": user[0]})
     db.commit()
 
     token = jwt.encode({
-        "user_id": str(user[0]),
-        "tenant_id": str(user[2]),
+        "user_id": user[0],
+        "company_id": user[2],
         "role": user[3],
         "exp": datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS),
     }, SECRET_KEY, algorithm=ALGORITHM)
@@ -422,30 +405,33 @@ async def login(req: LoginRequest, db: Session = Depends(get_db)):
 
 @app.post("/auth/register")
 async def register(req: RegisterRequest, db: Session = Depends(get_db)):
-    # Look up tenant by slug (used only at registration, never in URLs)
+    # Look up company by slug
     result = db.execute(text(
-        "SELECT id FROM tenants WHERE tenant_slug = :slug AND subscription_status = 'active'"
-    ), {"slug": req.tenant_code})
-    tenant = result.fetchone()
-    if not tenant:
+        "SELECT id FROM cal.companies WHERE slug = :slug AND is_active = true"
+    ), {"slug": req.company_code})
+    company = result.fetchone()
+    if not company:
         raise HTTPException(status_code=404, detail="Invalid registration code")
 
     # Check email not taken
-    result = db.execute(text("SELECT id FROM users WHERE email = :email"), {"email": req.email})
+    result = db.execute(text("SELECT id FROM cal.users WHERE email = :email"), {"email": req.email})
     if result.fetchone():
         raise HTTPException(status_code=409, detail="Email already registered")
 
     password_hash = pwd_context.hash(req.password)
     db.execute(text("""
-        INSERT INTO users (tenant_id, email, password_hash, name, role)
-        VALUES (:tid, :email, :hash, :name, 'admin')
-    """), {"tid": tenant[0], "email": req.email, "hash": password_hash, "name": req.name})
+        INSERT INTO cal.users (id, company_id, email, password_hash, first_name, last_name, role)
+        VALUES (nextval('cal.users_id_seq'), :cid, :email, :hash, :fname, :lname, 'user')
+    """), {
+        "cid": company[0], "email": req.email, "hash": password_hash,
+        "fname": req.first_name, "lname": req.last_name,
+    })
     db.commit()
 
     return {"status": "success", "message": "User created. Please login."}
 
 # ============================================================
-# CALIBRATION AGENT ENDPOINTS — tenant derived from JWT only
+# CALIBRATION AGENT ENDPOINTS
 # ============================================================
 
 @app.post("/cal/upload")
@@ -454,10 +440,10 @@ async def upload_cert(
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    set_tenant_context(db, auth["tenant_id"])
+    company_id = auth["company_id"]
 
     # Save file
-    upload_dir = Path(f"/app/uploads/{auth['tenant_id']}")
+    upload_dir = Path(f"/app/uploads/{company_id}")
     upload_dir.mkdir(parents=True, exist_ok=True)
     file_id = str(uuid.uuid4())
     file_path = upload_dir / f"{file_id}_{file.filename}"
@@ -466,24 +452,22 @@ async def upload_cert(
     file_path.write_bytes(content)
 
     # Load kernel and extract data
-    kernel = load_tenant_kernel(db, auth["tenant_id"])
+    kernel = load_tenant_kernel(db, company_id)
     prompt = f"""Extract calibration data from this uploaded certificate.
 Filename: {file.filename}
 File size: {len(content)} bytes
 
 Return ONLY a valid JSON object:
 {{
-    "equipment_id": "string - the equipment/instrument ID",
+    "tool_number": "string - the tool/instrument number or ID",
     "calibration_date": "YYYY-MM-DD",
-    "expiration_date": "YYYY-MM-DD",
-    "lab_name": "string - calibration lab name",
+    "next_due_date": "YYYY-MM-DD",
     "technician": "string - technician name if available, else empty",
-    "pass_fail": "pass or fail",
-    "notes": "string - any relevant notes"
+    "result": "pass or fail",
+    "comments": "string - any relevant notes"
 }}"""
 
     agent_response = call_agent(kernel, prompt)
-    log_tokens(db, auth["tenant_id"], auth["user_id"], "upload", agent_response)
 
     try:
         data = json.loads(agent_response["text"])
@@ -494,57 +478,69 @@ Return ONLY a valid JSON object:
         if start >= 0 and end > start:
             data = json.loads(text_resp[start:end])
         else:
-            db.commit()
             return {"status": "error", "message": "Could not parse certificate data. Please enter manually."}
 
-    # Look up equipment
+    # Look up tool
     result = db.execute(text("""
-        SELECT id FROM equipment
-        WHERE tenant_id = :tid AND equipment_id = :eid
-    """), {"tid": auth["tenant_id"], "eid": data.get("equipment_id", "")})
-    equipment = result.fetchone()
+        SELECT id FROM cal.tools
+        WHERE company_id = :cid AND number = :num
+    """), {"cid": company_id, "num": data.get("tool_number", "")})
+    tool = result.fetchone()
 
-    if not equipment:
-        db.commit()
+    if not tool:
         return {
             "status": "warning",
-            "message": f"Equipment '{data.get('equipment_id')}' not found in registry. Please add it first.",
+            "message": f"Tool '{data.get('tool_number')}' not found in registry. Please add it first.",
             "extracted_data": data,
         }
 
     # Insert calibration record
     db.execute(text("""
-        INSERT INTO calibration_records
-        (tenant_id, equipment_id, cert_file_path, cert_file_name,
-         calibration_date, expiration_date, lab_name, technician, pass_fail, notes, extracted_data)
-        VALUES (:tid, :eid, :path, :fname, :cal_date, :exp_date, :lab, :tech, :pf, :notes, :edata)
+        INSERT INTO cal.calibrations
+        (id, record_number, tool_id, calibration_date, result, next_due_date, technician, comments)
+        VALUES (nextval('cal.calibrations_id_seq'), :rnum, :tid, :cal_date, :result, :next_due, :tech, :comments)
     """), {
-        "tid": auth["tenant_id"], "eid": equipment[0],
-        "path": str(file_path), "fname": file.filename,
+        "rnum": f"CAL-{datetime.utcnow().strftime('%Y%m%d')}-{tool[0]}",
+        "tid": tool[0],
         "cal_date": data.get("calibration_date"),
-        "exp_date": data.get("expiration_date"),
-        "lab": data.get("lab_name", ""),
+        "result": data.get("result", "pass"),
+        "next_due": data.get("next_due_date"),
         "tech": data.get("technician", ""),
-        "pf": data.get("pass_fail", "pass"),
-        "notes": data.get("notes", ""),
-        "edata": json.dumps(data),
+        "comments": data.get("comments", ""),
     })
 
-    # Log event
+    # Insert attachment record
     db.execute(text("""
-        INSERT INTO calibration_events (tenant_id, equipment_id, event_type, event_data, created_by)
-        VALUES (:tid, :eid, 'cert_uploaded', :edata, :uid)
+        INSERT INTO cal.attachments
+        (id, tool_id, calibration_id, filename, original_name, file_size, mime_type)
+        VALUES (nextval('cal.attachments_id_seq'), :tid,
+                currval('cal.calibrations_id_seq'), :fname, :oname, :fsize, :mime)
     """), {
-        "tid": auth["tenant_id"], "eid": equipment[0],
-        "edata": json.dumps({"file": file.filename, "extracted": data}),
-        "uid": auth["user_id"],
+        "tid": tool[0],
+        "fname": f"{file_id}_{file.filename}",
+        "oname": file.filename,
+        "fsize": len(content),
+        "mime": file.content_type or "application/octet-stream",
+    })
+
+    # Update tool's last calibration date
+    db.execute(text("""
+        UPDATE cal.tools
+        SET last_calibration_date = :cal_date,
+            next_due_date = :next_due,
+            calibration_status = 'current'
+        WHERE id = :tid
+    """), {
+        "cal_date": data.get("calibration_date"),
+        "next_due": data.get("next_due_date"),
+        "tid": tool[0],
     })
 
     db.commit()
 
     return {
         "status": "success",
-        "message": f"Calibration cert for {data['equipment_id']} processed. Expires {data.get('expiration_date', 'unknown')}.",
+        "message": f"Calibration cert for {data['tool_number']} processed. Next due {data.get('next_due_date', 'unknown')}.",
         "data": data,
     }
 
@@ -554,35 +550,37 @@ async def ask_question(
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    set_tenant_context(db, auth["tenant_id"])
+    company_id = auth["company_id"]
 
     # Build context from calibration data
     result = db.execute(text("""
-        SELECT e.equipment_id, e.equipment_type, e.critical,
-               cr.calibration_date, cr.expiration_date, cr.lab_name, cr.status, cr.pass_fail
-        FROM calibration_records cr
-        JOIN equipment e ON cr.equipment_id = e.id
-        WHERE cr.tenant_id = :tid
-        ORDER BY cr.expiration_date ASC
-    """), {"tid": auth["tenant_id"]})
+        SELECT t.number, t.type, t.manufacturer,
+               c.calibration_date, c.next_due_date, c.technician,
+               t.calibration_status, c.result, c.comments
+        FROM cal.calibrations c
+        JOIN cal.tools t ON c.tool_id = t.id
+        WHERE t.company_id = :cid
+        ORDER BY c.next_due_date ASC
+    """), {"cid": company_id})
     cal_data = result.fetchall()
 
     context = "Current calibration records:\n" + "\n".join([
-        f"- {r[0]} ({r[1]}, critical={r[2]}): Cal {r[3]}, Expires {r[4]}, Lab: {r[5]}, Status: {r[6]}, Result: {r[7]}"
+        f"- {r[0]} ({r[1]}, mfr={r[2]}): Cal {r[3]}, Due {r[4]}, Tech: {r[5]}, Status: {r[6]}, Result: {r[7]}"
         for r in cal_data
     ]) if cal_data else "No calibration records on file yet."
 
     # Get equipment summary
     result = db.execute(text("""
-        SELECT COUNT(*), COUNT(CASE WHEN critical THEN 1 END)
-        FROM equipment WHERE tenant_id = :tid
-    """), {"tid": auth["tenant_id"]})
+        SELECT COUNT(*),
+               COUNT(CASE WHEN calibration_status = 'overdue' THEN 1 END),
+               COUNT(CASE WHEN calibration_status = 'current' THEN 1 END)
+        FROM cal.tools WHERE company_id = :cid
+    """), {"cid": company_id})
     eq_counts = result.fetchone()
-    context += f"\n\nEquipment summary: {eq_counts[0]} total, {eq_counts[1]} critical."
+    context += f"\n\nEquipment summary: {eq_counts[0]} total, {eq_counts[2]} current, {eq_counts[1]} overdue."
 
-    kernel = load_tenant_kernel(db, auth["tenant_id"])
+    kernel = load_tenant_kernel(db, company_id)
     agent_response = call_agent(kernel, req.question, context)
-    log_tokens(db, auth["tenant_id"], auth["user_id"], "question", agent_response)
     db.commit()
 
     return {"status": "success", "answer": agent_response["text"]}
@@ -598,19 +596,18 @@ async def upload_logo(
         raise HTTPException(status_code=403, detail="Admin only")
 
     result = db.execute(text(
-        "SELECT tenant_slug FROM tenants WHERE id = :tid"
-    ), {"tid": auth["tenant_id"]})
-    tenant = result.fetchone()
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+        "SELECT slug FROM cal.companies WHERE id = :cid"
+    ), {"cid": auth["company_id"]})
+    company = result.fetchone()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
 
-    slug = tenant[0]
+    slug = company[0]
     logo_dir = Path(f"/app/uploads/tenants/{slug}")
     logo_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read the branding block to get expected filename
     tenant_kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
-    logo_filename = "logo.png"  # default
+    logo_filename = "logo.png"
     if tenant_kernel_path.exists():
         content = tenant_kernel_path.read_text()
         match = re.search(r'logo_file\s*:=\s*(\S+)', content)
@@ -631,28 +628,40 @@ async def generate_evidence(
     db: Session = Depends(get_db),
 ):
     from fastapi.responses import Response
-
-    set_tenant_context(db, auth["tenant_id"])
+    company_id = auth["company_id"]
 
     # Build query based on evidence type
-    where_clause = ""
+    where_extra = ""
     if req.evidence_type == "overdue":
-        where_clause = "AND cr.status = 'overdue'"
+        where_extra = "AND t.calibration_status = 'overdue'"
     elif req.evidence_type == "expiring_soon":
-        where_clause = "AND cr.status = 'expiring_soon'"
+        where_extra = "AND t.calibration_status = 'expiring_soon'"
 
     result = db.execute(text(f"""
-        SELECT e.equipment_id, e.equipment_type, e.critical,
-               cr.calibration_date, cr.expiration_date, cr.lab_name, cr.status,
-               cr.cert_file_name, cr.pass_fail
-        FROM calibration_records cr
-        JOIN equipment e ON cr.equipment_id = e.id
-        WHERE cr.tenant_id = :tid {where_clause}
-        ORDER BY e.equipment_type, e.equipment_id
-    """), {"tid": auth["tenant_id"]})
-    records = result.fetchall()
+        SELECT t.number, t.type, t.manufacturer, t.serial_number,
+               t.last_calibration_date, t.next_due_date, t.calibration_status,
+               t.location, c.result
+        FROM cal.tools t
+        LEFT JOIN LATERAL (
+            SELECT result FROM cal.calibrations
+            WHERE tool_id = t.id ORDER BY calibration_date DESC LIMIT 1
+        ) c ON true
+        WHERE t.company_id = :cid {where_extra}
+        ORDER BY t.type, t.number
+    """), {"cid": company_id})
+    rows = result.fetchall()
 
-    kernel = load_tenant_kernel(db, auth["tenant_id"])
+    records = [
+        {
+            "number": r[0], "type": r[1], "manufacturer": r[2],
+            "serial_number": r[3], "last_calibration_date": str(r[4]) if r[4] else "",
+            "next_due_date": str(r[5]) if r[5] else "", "calibration_status": r[6] or "",
+            "location": r[7] or "", "result": r[8] or "",
+        }
+        for r in rows
+    ]
+
+    kernel = load_tenant_kernel(db, company_id)
     prompt = f"""Generate an audit evidence package summary for these calibration records.
 Include:
 - Executive summary of calibration program health
@@ -664,17 +673,15 @@ Total records: {len(records)}
 
 Records:
 """ + "\n".join([
-        f"- {r[0]} ({r[1]}, critical={r[2]}): Cal {r[3]}, Exp {r[4]}, Lab: {r[5]}, Status: {r[6]}, Result: {r[8]}"
+        f"- {r['number']} ({r['type']}, {r['manufacturer']}): Cal {r['last_calibration_date']}, Due {r['next_due_date']}, Status: {r['calibration_status']}, Result: {r['result']}"
         for r in records
     ])
 
     agent_response = call_agent(kernel, prompt)
-    log_tokens(db, auth["tenant_id"], auth["user_id"], "download", agent_response)
     db.commit()
 
-    # Generate branded PDF
     if req.format == "pdf":
-        branding = load_tenant_branding(db, auth["tenant_id"])
+        branding = load_tenant_branding(db, company_id)
         pdf_bytes = generate_branded_pdf(branding, records, req.evidence_type, agent_response["text"])
         filename = f"cal_evidence_{req.evidence_type}_{datetime.utcnow().strftime('%Y%m%d')}.pdf"
         return Response(
@@ -683,7 +690,6 @@ Records:
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
-    # Fallback: text/JSON response
     return {
         "status": "success",
         "package_description": agent_response["text"],
@@ -700,37 +706,29 @@ async def list_equipment(
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    set_tenant_context(db, auth["tenant_id"])
+    company_id = auth["company_id"]
 
     result = db.execute(text("""
-        SELECT e.id, e.equipment_id, e.equipment_type, e.description, e.manufacturer,
-               e.model, e.serial_number, e.location, e.cal_frequency_months,
-               e.lab_name, e.critical, e.status,
-               cr.calibration_date AS last_cal_date,
-               cr.expiration_date AS next_exp_date,
-               cr.status AS cal_status
-        FROM equipment e
-        LEFT JOIN LATERAL (
-            SELECT calibration_date, expiration_date, status
-            FROM calibration_records
-            WHERE equipment_id = e.id
-            ORDER BY calibration_date DESC LIMIT 1
-        ) cr ON true
-        WHERE e.tenant_id = :tid
-        ORDER BY e.equipment_type, e.equipment_id
-    """), {"tid": auth["tenant_id"]})
+        SELECT t.id, t.number, t.type, t.description, t.manufacturer,
+               t.model, t.serial_number, t.location, t.building,
+               t.frequency, t.ownership, t.calibration_status, t.tool_status,
+               t.last_calibration_date, t.next_due_date
+        FROM cal.tools t
+        WHERE t.company_id = :cid
+        ORDER BY t.type, t.number
+    """), {"cid": company_id})
 
     rows = result.fetchall()
     return {
         "equipment": [
             {
-                "id": str(r[0]), "equipment_id": r[1], "equipment_type": r[2],
+                "id": r[0], "number": r[1], "type": r[2],
                 "description": r[3], "manufacturer": r[4], "model": r[5],
-                "serial_number": r[6], "location": r[7], "cal_frequency_months": r[8],
-                "lab_name": r[9], "critical": r[10], "status": r[11],
-                "last_cal_date": str(r[12]) if r[12] else None,
-                "next_exp_date": str(r[13]) if r[13] else None,
-                "cal_status": r[14],
+                "serial_number": r[6], "location": r[7], "building": r[8],
+                "frequency": r[9], "ownership": r[10],
+                "calibration_status": r[11], "tool_status": r[12],
+                "last_cal_date": str(r[13]) if r[13] else None,
+                "next_due_date": str(r[14]) if r[14] else None,
             }
             for r in rows
         ],
@@ -743,22 +741,23 @@ async def add_equipment(
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    set_tenant_context(db, auth["tenant_id"])
+    company_id = auth["company_id"]
 
     db.execute(text("""
-        INSERT INTO equipment
-        (tenant_id, equipment_id, equipment_type, description, manufacturer,
-         model, serial_number, location, cal_frequency_months, lab_name, critical)
-        VALUES (:tid, :eid, :etype, :desc, :mfr, :model, :sn, :loc, :freq, :lab, :crit)
+        INSERT INTO cal.tools
+        (id, company_id, number, type, description, manufacturer,
+         model, serial_number, location, building, frequency, ownership)
+        VALUES (nextval('cal.tools_id_seq'), :cid, :num, :type, :desc, :mfr,
+                :model, :sn, :loc, :bldg, :freq, :own)
     """), {
-        "tid": auth["tenant_id"], "eid": eq.equipment_id, "etype": eq.equipment_type,
+        "cid": company_id, "num": eq.number, "type": eq.type,
         "desc": eq.description, "mfr": eq.manufacturer, "model": eq.model,
-        "sn": eq.serial_number, "loc": eq.location, "freq": eq.cal_frequency_months,
-        "lab": eq.lab_name, "crit": eq.critical,
+        "sn": eq.serial_number, "loc": eq.location, "bldg": eq.building,
+        "freq": eq.frequency, "own": eq.ownership,
     })
     db.commit()
 
-    return {"status": "success", "message": f"Equipment {eq.equipment_id} added."}
+    return {"status": "success", "message": f"Tool {eq.number} added."}
 
 # ============================================================
 # DASHBOARD DATA
@@ -769,56 +768,56 @@ async def dashboard(
     auth: dict = Depends(verify_token),
     db: Session = Depends(get_db),
 ):
-    set_tenant_context(db, auth["tenant_id"])
+    company_id = auth["company_id"]
 
-    eq_count = db.execute(text(
-        "SELECT COUNT(*) FROM equipment WHERE tenant_id = :tid"
-    ), {"tid": auth["tenant_id"]}).scalar()
+    tool_count = db.execute(text(
+        "SELECT COUNT(*) FROM cal.tools WHERE company_id = :cid"
+    ), {"cid": company_id}).scalar()
 
     status_counts = db.execute(text("""
-        SELECT status, COUNT(*) FROM calibration_records
-        WHERE tenant_id = :tid GROUP BY status
-    """), {"tid": auth["tenant_id"]}).fetchall()
+        SELECT calibration_status, COUNT(*) FROM cal.tools
+        WHERE company_id = :cid GROUP BY calibration_status
+    """), {"cid": company_id}).fetchall()
+
+    cal_count = db.execute(text("""
+        SELECT COUNT(*) FROM cal.calibrations c
+        JOIN cal.tools t ON c.tool_id = t.id
+        WHERE t.company_id = :cid
+    """), {"cid": company_id}).scalar()
 
     upcoming = db.execute(text("""
-        SELECT e.equipment_id, e.equipment_type, e.critical,
-               cr.expiration_date, cr.status
-        FROM calibration_records cr
-        JOIN equipment e ON cr.equipment_id = e.id
-        WHERE cr.tenant_id = :tid
-          AND cr.expiration_date <= CURRENT_DATE + INTERVAL '60 days'
-          AND cr.expiration_date >= CURRENT_DATE
-        ORDER BY cr.expiration_date ASC
-    """), {"tid": auth["tenant_id"]}).fetchall()
+        SELECT t.number, t.type, t.manufacturer,
+               t.next_due_date, t.calibration_status
+        FROM cal.tools t
+        WHERE t.company_id = :cid
+          AND t.next_due_date <= CURRENT_DATE + INTERVAL '60 days'
+          AND t.next_due_date >= CURRENT_DATE
+        ORDER BY t.next_due_date ASC
+    """), {"cid": company_id}).fetchall()
 
-    token_usage = db.execute(text("""
-        SELECT COALESCE(SUM(input_tokens + output_tokens), 0),
-               COALESCE(SUM(cost), 0)
-        FROM token_usage
-        WHERE tenant_id = :tid
-          AND timestamp >= DATE_TRUNC('month', CURRENT_DATE)
-    """), {"tid": auth["tenant_id"]}).fetchone()
-
-    events = db.execute(text("""
-        SELECT ce.event_type, ce.event_data, ce.created_at, e.equipment_id
-        FROM calibration_events ce
-        LEFT JOIN equipment e ON ce.equipment_id = e.id
-        WHERE ce.tenant_id = :tid
-        ORDER BY ce.created_at DESC LIMIT 10
-    """), {"tid": auth["tenant_id"]}).fetchall()
+    overdue = db.execute(text("""
+        SELECT t.number, t.type, t.manufacturer,
+               t.next_due_date, t.calibration_status
+        FROM cal.tools t
+        WHERE t.company_id = :cid
+          AND (t.calibration_status = 'overdue'
+               OR (t.next_due_date IS NOT NULL AND t.next_due_date < CURRENT_DATE))
+        ORDER BY t.next_due_date ASC
+    """), {"cid": company_id}).fetchall()
 
     return {
-        "equipment_count": eq_count,
-        "status_summary": {r[0]: r[1] for r in status_counts},
+        "tool_count": tool_count,
+        "calibration_count": cal_count,
+        "status_summary": {r[0]: r[1] for r in status_counts if r[0]},
         "upcoming_expirations": [
-            {"equipment_id": r[0], "type": r[1], "critical": r[2],
-             "expiration_date": str(r[3]), "status": r[4]}
+            {"number": r[0], "type": r[1], "manufacturer": r[2],
+             "next_due_date": str(r[3]), "status": r[4]}
             for r in upcoming
         ],
-        "token_usage": {"tokens": token_usage[0], "cost": float(token_usage[1])},
-        "recent_events": [
-            {"type": r[0], "data": r[1], "timestamp": r[2].isoformat(), "equipment_id": r[3]}
-            for r in events
+        "overdue": [
+            {"number": r[0], "type": r[1], "manufacturer": r[2],
+             "next_due_date": str(r[3]) if r[3] else None, "status": r[4]}
+            for r in overdue
         ],
     }
 
@@ -831,6 +830,6 @@ async def health():
     return {
         "status": "healthy",
         "product": "cal.gp3.app",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "timestamp": datetime.utcnow().isoformat(),
     }

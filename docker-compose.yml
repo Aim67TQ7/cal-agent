@@ -2,56 +2,29 @@ version: '3.8'
 
 # Co-located on Maggie VPS (89.116.157.23)
 # Caddy is handled by n0v8v stack — we join its network
+# Database: Supabase GP3 project (zoda) — cal schema
 
 services:
-  cal-postgres:
-    image: postgres:15-alpine
-    container_name: cal-postgres
-    environment:
-      POSTGRES_DB: cal_gp3
-      POSTGRES_USER: cal_admin
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-    volumes:
-      - cal-pgdata:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
-    ports:
-      - "127.0.0.1:5435:5432"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cal_admin -d cal_gp3"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - cal-net
-
   cal-backend:
     build: ./backend
     container_name: cal-backend
     environment:
-      DATABASE_URL: postgresql://cal_app:${DB_APP_PASSWORD}@cal-postgres:5432/cal_gp3
+      DATABASE_URL: ${SUPABASE_DB_URL}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       SECRET_KEY: ${SECRET_KEY}
       ENVIRONMENT: ${ENVIRONMENT:-production}
     volumes:
       - ./kernels:/app/kernels:ro
       - cal-uploads:/app/uploads
-    depends_on:
-      cal-postgres:
-        condition: service_healthy
     ports:
       - "127.0.0.1:8200:8000"
     restart: unless-stopped
     networks:
-      - cal-net
       - n0v8v_n0v8v-net
 
 volumes:
-  cal-pgdata:
   cal-uploads:
 
 networks:
-  cal-net:
-    name: cal-net
   n0v8v_n0v8v-net:
     external: true
