@@ -5,26 +5,26 @@
 **Status:** Active
 
 ## What This Was
-GP3 platform component
+Multi-tenant AI calibration management agent
 
 ## Current State
-Active — last pushed 2026-02-22. Part of current GP3 platform or active development.
+Active — deployed on Maggie VPS
 
 ## Agent Replacement
 **Agent Name:** Cal Agent
 **Lives On:** Maggie (89.116.157.23)
 **Orchestrator:** Standalone FastAPI
 **Endpoint or Trigger:** https://cal.gp3.app
-**Supabase Table:** N/A
+**Supabase Table:** N/A (local PG, migrating)
 
 ## Handoff Notes
-This repo's core function was: Calibration management/tracking. Business context: GP3 platform component.
+Core function: Track calibration schedules, record measurements, flag overdue instruments. Context: Multi-tenant AI calibration management agent
 
 ## Dependencies
-- None identified from README
+- None identified — check package.json for specifics
 
 ## Last Known Working State
 2026-02-22
 
 ## Claude's Notes
-- WARNING: No README found. Classification based on name/description only.
+- No README existed. Classification based on repo name.
