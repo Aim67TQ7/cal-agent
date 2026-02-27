@@ -17,8 +17,9 @@ function LoginPage({ onLogin }) {
   const [mode, setMode] = useState('login') // login | register
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [name, setName] = useState('')
-  const [tenantCode, setTenantCode] = useState('')
+  const [firstName, setFirstName] = useState('')
+  const [lastName, setLastName] = useState('')
+  const [companyCode, setCompanyCode] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
@@ -34,11 +35,14 @@ function LoginPage({ onLogin }) {
         const res = await api().post('/auth/login', { email, password })
         onLogin(res.data)
       } else {
-        await api().post('/auth/register', { email, password, name, tenant_code: tenantCode })
+        await api().post('/auth/register', {
+          email, password, first_name: firstName, last_name: lastName, company_code: companyCode,
+        })
         setSuccess('Account created! You can now sign in.')
         setMode('login')
-        setName('')
-        setTenantCode('')
+        setFirstName('')
+        setLastName('')
+        setCompanyCode('')
       }
     } catch (err) {
       setError(err.response?.data?.detail || (mode === 'login' ? 'Login failed' : 'Registration failed'))
@@ -65,7 +69,10 @@ function LoginPage({ onLogin }) {
             {mode === 'login' ? 'Sign In' : 'Create Account'}
           </div>
           {mode === 'register' && (
-            <input type="text" placeholder="Full Name" value={name} onChange={e => setName(e.target.value)} required />
+            <div style={{ display: 'flex', gap: 10 }}>
+              <input type="text" placeholder="First Name" value={firstName} onChange={e => setFirstName(e.target.value)} required style={{ flex: 1 }} />
+              <input type="text" placeholder="Last Name" value={lastName} onChange={e => setLastName(e.target.value)} style={{ flex: 1 }} />
+            </div>
           )}
           <input type="email" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} required />
           <div style={{ position: 'relative' }}>
@@ -92,7 +99,7 @@ function LoginPage({ onLogin }) {
             </button>
           </div>
           {mode === 'register' && (
-            <input type="text" placeholder="Organization Code" value={tenantCode} onChange={e => setTenantCode(e.target.value)} required />
+            <input type="text" placeholder="Company Code" value={companyCode} onChange={e => setCompanyCode(e.target.value)} required />
           )}
           {error && <div style={{ color: 'var(--danger)', fontSize: 13 }}>{error}</div>}
           {success && <div style={{ color: 'var(--success)', fontSize: 13 }}>{success}</div>}
@@ -125,7 +132,7 @@ function LoginPage({ onLogin }) {
 function Dashboard({ data }) {
   if (!data) return <div style={{ color: 'var(--text-muted)' }}>Loading dashboard...</div>
 
-  const total = Object.values(data.status_summary || {}).reduce((a, b) => a + b, 0)
+  const total = data.tool_count || 0
   const current = data.status_summary?.current || 0
   const complianceRate = total > 0 ? Math.round((current / total) * 100) : 0
 
@@ -133,11 +140,42 @@ function Dashboard({ data }) {
     <div>
       <h2 style={{ marginBottom: 20, fontSize: 20 }}>Dashboard</h2>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
-        <StatCard label="Equipment" value={data.equipment_count} />
+        <StatCard label="Tools" value={data.tool_count || 0} />
         <StatCard label="Compliance" value={`${complianceRate}%`} color={complianceRate >= 90 ? 'var(--success)' : 'var(--warning)'} />
         <StatCard label="Expiring Soon" value={data.status_summary?.expiring_soon || 0} color="var(--warning)" />
         <StatCard label="Overdue" value={data.status_summary?.overdue || 0} color={data.status_summary?.overdue > 0 ? 'var(--danger)' : 'var(--success)'} />
       </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
+        <StatCard label="Calibration Records" value={data.calibration_count || 0} />
+        <StatCard label="Status Categories" value={Object.keys(data.status_summary || {}).length} />
+      </div>
+
+      {data.overdue?.length > 0 && (
+        <div className="card" style={{ marginBottom: 20, borderLeft: '3px solid var(--danger)' }}>
+          <h3 style={{ marginBottom: 12, fontSize: 15, color: 'var(--danger)' }}>Overdue ({data.overdue.length})</h3>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text-muted)' }}>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Tool #</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Type</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Manufacturer</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Due Date</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.overdue.map((item, i) => (
+                <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{item.number}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.type}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.manufacturer}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--danger)' }}>{item.next_due_date || 'Not set'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       {data.upcoming_expirations?.length > 0 && (
         <div className="card" style={{ marginBottom: 20 }}>
@@ -145,24 +183,23 @@ function Dashboard({ data }) {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text-muted)' }}>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Equipment</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Tool #</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Type</th>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Expires</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Manufacturer</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Due Date</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Status</th>
               </tr>
             </thead>
             <tbody>
               {data.upcoming_expirations.map((item, i) => (
                 <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '10px 0' }}>
-                    {item.equipment_id}
-                    {item.critical && <span className="badge badge-critical" style={{ marginLeft: 8 }}>CRITICAL</span>}
-                  </td>
+                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{item.number}</td>
                   <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.type}</td>
-                  <td style={{ padding: '10px 0' }}>{item.expiration_date}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.manufacturer}</td>
+                  <td style={{ padding: '10px 0' }}>{item.next_due_date}</td>
                   <td style={{ padding: '10px 0' }}>
                     <span className={`badge badge-${item.status === 'expiring_soon' ? 'expiring' : item.status}`}>
-                      {item.status}
+                      {(item.status || '').replace(/_/g, ' ')}
                     </span>
                   </td>
                 </tr>
@@ -171,17 +208,6 @@ function Dashboard({ data }) {
           </table>
         </div>
       )}
-
-      <div className="card">
-        <h3 style={{ marginBottom: 12, fontSize: 15 }}>Recent Activity</h3>
-        {data.recent_events?.length === 0 && <div style={{ color: 'var(--text-muted)', fontSize: 13 }}>No activity yet.</div>}
-        {data.recent_events?.map((ev, i) => (
-          <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: i < data.recent_events.length - 1 ? '1px solid var(--border)' : 'none', fontSize: 13 }}>
-            <span>{ev.type.replace(/_/g, ' ')} {ev.equipment_id && `- ${ev.equipment_id}`}</span>
-            <span style={{ color: 'var(--text-muted)' }}>{new Date(ev.timestamp).toLocaleString()}</span>
-          </div>
-        ))}
-      </div>
     </div>
   )
 }
@@ -261,9 +287,9 @@ function UploadPage({ token }) {
         }}>
           <div style={{ fontWeight: 600, marginBottom: 6 }}>{response.status.toUpperCase()}</div>
           <div style={{ fontSize: 14 }}>{response.message}</div>
-          {response.data && (
+          {(response.data || response.extracted_data) && (
             <pre style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)', overflow: 'auto' }}>
-              {JSON.stringify(response.data, null, 2)}
+              {JSON.stringify(response.data || response.extracted_data, null, 2)}
             </pre>
           )}
         </div>
@@ -301,7 +327,7 @@ function QuestionPage({ token }) {
       <h2 style={{ marginBottom: 20, fontSize: 20 }}>Ask the Agent</h2>
       <form onSubmit={handleAsk} style={{ display: 'flex', gap: 10 }}>
         <textarea
-          placeholder="Which gauges expire in Q2? What's our compliance rate? Which labs do we use?"
+          placeholder="Which tools are overdue? What's our compliance rate? List all gaussmeters."
           value={question}
           onChange={e => setQuestion(e.target.value)}
           style={{ flex: 1, minHeight: 80, resize: 'vertical' }}
@@ -330,6 +356,7 @@ function QuestionPage({ token }) {
 // ============================================================
 function DownloadPage({ token }) {
   const [evidenceType, setEvidenceType] = useState('all_current')
+  const [format, setFormat] = useState('json')
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
 
@@ -337,8 +364,19 @@ function DownloadPage({ token }) {
     setLoading(true)
     setResult(null)
     try {
-      const res = await api(token).post('/cal/download', { evidence_type: evidenceType })
-      setResult(res.data)
+      if (format === 'pdf') {
+        const res = await api(token).post('/cal/download', { evidence_type: evidenceType, format: 'pdf' }, { responseType: 'blob' })
+        const url = window.URL.createObjectURL(new Blob([res.data], { type: 'application/pdf' }))
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `cal_evidence_${evidenceType}_${new Date().toISOString().slice(0, 10)}.pdf`
+        a.click()
+        window.URL.revokeObjectURL(url)
+        setResult({ status: 'success', package_description: 'PDF downloaded.' })
+      } else {
+        const res = await api(token).post('/cal/download', { evidence_type: evidenceType, format: 'json' })
+        setResult(res.data)
+      }
     } catch (err) {
       setResult({ status: 'error', package_description: err.response?.data?.detail || 'Generation failed' })
     } finally {
@@ -358,8 +396,15 @@ function DownloadPage({ token }) {
             <option value="expiring_soon">Expiring Soon</option>
           </select>
         </div>
+        <div>
+          <label style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6, display: 'block' }}>Format</label>
+          <select value={format} onChange={e => setFormat(e.target.value)}>
+            <option value="json">Summary (Text)</option>
+            <option value="pdf">Branded PDF</option>
+          </select>
+        </div>
         <button onClick={handleGenerate} disabled={loading} style={{ minWidth: 140 }}>
-          {loading ? 'Generating...' : 'Generate Package'}
+          {loading ? 'Generating...' : format === 'pdf' ? 'Download PDF' : 'Generate Package'}
         </button>
       </div>
 
@@ -368,7 +413,8 @@ function DownloadPage({ token }) {
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
             <span style={{ fontWeight: 600 }}>Evidence Package</span>
             <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-              {result.record_count} records | {result.generated_at && new Date(result.generated_at).toLocaleString()}
+              {result.record_count != null && `${result.record_count} records`}
+              {result.generated_at && ` | ${new Date(result.generated_at).toLocaleString()}`}
             </span>
           </div>
           <div style={{ fontSize: 14, lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>
@@ -386,7 +432,10 @@ function DownloadPage({ token }) {
 function EquipmentPage({ token }) {
   const [equipment, setEquipment] = useState([])
   const [showAdd, setShowAdd] = useState(false)
-  const [form, setForm] = useState({ equipment_id: '', equipment_type: '', cal_frequency_months: 12, lab_name: '', critical: false })
+  const [form, setForm] = useState({
+    number: '', type: '', description: '', manufacturer: '', model: '',
+    serial_number: '', location: '', building: '', frequency: 'annual', ownership: '',
+  })
 
   useEffect(() => { loadEquipment() }, [])
 
@@ -402,71 +451,82 @@ function EquipmentPage({ token }) {
     try {
       await api(token).post('/cal/equipment', form)
       setShowAdd(false)
-      setForm({ equipment_id: '', equipment_type: '', cal_frequency_months: 12, lab_name: '', critical: false })
+      setForm({
+        number: '', type: '', description: '', manufacturer: '', model: '',
+        serial_number: '', location: '', building: '', frequency: 'annual', ownership: '',
+      })
       loadEquipment()
     } catch { }
   }
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20 }}>
-        <h2 style={{ fontSize: 20 }}>Equipment Registry</h2>
-        <button onClick={() => setShowAdd(!showAdd)}>{showAdd ? 'Cancel' : '+ Add Equipment'}</button>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <h2 style={{ fontSize: 20 }}>Equipment Registry ({equipment.length})</h2>
+        <button onClick={() => setShowAdd(!showAdd)}>{showAdd ? 'Cancel' : '+ Add Tool'}</button>
       </div>
 
       {showAdd && (
         <form onSubmit={handleAdd} className="card" style={{ marginBottom: 20, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-          <input placeholder="Equipment ID *" value={form.equipment_id} onChange={e => setForm({ ...form, equipment_id: e.target.value })} required />
-          <input placeholder="Type (e.g., caliper, gauge)" value={form.equipment_type} onChange={e => setForm({ ...form, equipment_type: e.target.value })} />
-          <input placeholder="Cal frequency (months)" type="number" value={form.cal_frequency_months} onChange={e => setForm({ ...form, cal_frequency_months: parseInt(e.target.value) || 12 })} />
-          <input placeholder="Lab name" value={form.lab_name} onChange={e => setForm({ ...form, lab_name: e.target.value })} />
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14 }}>
-            <input type="checkbox" checked={form.critical} onChange={e => setForm({ ...form, critical: e.target.checked })} />
-            Critical equipment
-          </label>
-          <button type="submit">Save</button>
+          <input placeholder="Tool Number *" value={form.number} onChange={e => setForm({ ...form, number: e.target.value })} required />
+          <input placeholder="Type (e.g., caliper, gauge)" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} />
+          <input placeholder="Manufacturer" value={form.manufacturer} onChange={e => setForm({ ...form, manufacturer: e.target.value })} />
+          <input placeholder="Model" value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} />
+          <input placeholder="Serial Number" value={form.serial_number} onChange={e => setForm({ ...form, serial_number: e.target.value })} />
+          <input placeholder="Location" value={form.location} onChange={e => setForm({ ...form, location: e.target.value })} />
+          <input placeholder="Building" value={form.building} onChange={e => setForm({ ...form, building: e.target.value })} />
+          <select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })}>
+            <option value="annual">Annual</option>
+            <option value="semi-annual">Semi-Annual</option>
+            <option value="quarterly">Quarterly</option>
+            <option value="monthly">Monthly</option>
+            <option value="as-needed">As Needed</option>
+          </select>
+          <input placeholder="Description" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} style={{ gridColumn: '1 / -1' }} />
+          <button type="submit" style={{ gridColumn: '1 / -1' }}>Save Tool</button>
         </form>
       )}
 
-      <div className="card">
-        {equipment.length === 0 && <div style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 30 }}>No equipment registered. Add your first piece of equipment above.</div>}
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          {equipment.length > 0 && (
+      <div className="card" style={{ overflowX: 'auto' }}>
+        {equipment.length === 0 && <div style={{ color: 'var(--text-muted)', textAlign: 'center', padding: 30 }}>No equipment registered yet.</div>}
+        {equipment.length > 0 && (
+          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 700 }}>
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text-muted)' }}>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>ID</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Tool #</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Type</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Manufacturer</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Model</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Location</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Frequency</th>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Lab</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Last Cal</th>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Expires</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Due</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Status</th>
               </tr>
             </thead>
-          )}
-          <tbody>
-            {equipment.map((eq) => (
-              <tr key={eq.id} style={{ borderBottom: '1px solid var(--border)' }}>
-                <td style={{ padding: '10px 0', fontWeight: 600 }}>
-                  {eq.equipment_id}
-                  {eq.critical && <span className="badge badge-critical" style={{ marginLeft: 8, fontSize: 10 }}>CRIT</span>}
-                </td>
-                <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.equipment_type}</td>
-                <td style={{ padding: '10px 0' }}>{eq.cal_frequency_months}mo</td>
-                <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.lab_name}</td>
-                <td style={{ padding: '10px 0' }}>{eq.last_cal_date || '-'}</td>
-                <td style={{ padding: '10px 0' }}>{eq.next_exp_date || '-'}</td>
-                <td style={{ padding: '10px 0' }}>
-                  {eq.cal_status && (
-                    <span className={`badge badge-${eq.cal_status === 'expiring_soon' ? 'expiring' : eq.cal_status}`}>
-                      {eq.cal_status}
-                    </span>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+            <tbody>
+              {equipment.map((eq) => (
+                <tr key={eq.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{eq.number}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.type}</td>
+                  <td style={{ padding: '10px 0' }}>{eq.manufacturer}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.model}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.location}</td>
+                  <td style={{ padding: '10px 0' }}>{eq.frequency}</td>
+                  <td style={{ padding: '10px 0' }}>{eq.last_cal_date || '-'}</td>
+                  <td style={{ padding: '10px 0' }}>{eq.next_due_date || '-'}</td>
+                  <td style={{ padding: '10px 0' }}>
+                    {eq.calibration_status && (
+                      <span className={`badge badge-${eq.calibration_status === 'expiring_soon' ? 'expiring' : eq.calibration_status}`}>
+                        {eq.calibration_status.replace(/_/g, ' ')}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   )

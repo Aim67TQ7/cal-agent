@@ -13,6 +13,10 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       SECRET_KEY: ${SECRET_KEY}
       ENVIRONMENT: ${ENVIRONMENT:-production}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      EMAIL_WEBHOOK_SECRET: ${EMAIL_WEBHOOK_SECRET:-}
+      MAILGUN_API_KEY: ${MAILGUN_API_KEY:-}
+      MAILGUN_DOMAIN: ${MAILGUN_DOMAIN:-gp3.app}
     volumes:
       - ./kernels:/app/kernels:ro
       - cal-uploads:/app/uploads

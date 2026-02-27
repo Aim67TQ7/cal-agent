@@ -27,7 +27,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://cal.gp3.app"],
+    allow_origins=["https://cal.gp3.app", "http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -830,6 +830,369 @@ async def health():
     return {
         "status": "healthy",
         "product": "cal.gp3.app",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "timestamp": datetime.utcnow().isoformat(),
+    }
+
+# ============================================================
+# TTS PROXY (ElevenLabs)
+# ============================================================
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+
+class TTSRequest(BaseModel):
+    text: str
+    voice_id: str = "EXAVITQu4vr4xnSDxMaL"
+
+@app.post("/api/tts")
+async def text_to_speech(req: TTSRequest):
+    from fastapi.responses import Response
+    import httpx
+
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=503, detail="TTS not configured")
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{req.voice_id}/stream",
+            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+            json={
+                "text": req.text,
+                "model_id": "eleven_turbo_v2_5",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="TTS service error")
+        return Response(content=resp.content, media_type="audio/mpeg")
+
+# ============================================================
+# WEBSOCKET — AGENT PROACTIVE EVENTS
+# ============================================================
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+# In-memory connection registry
+_ws_connections: dict[str, list[WebSocket]] = {}
+
+@app.websocket("/ws/agent-events")
+async def agent_events(ws: WebSocket, agent_id: str = "cal"):
+    await ws.accept()
+    _ws_connections.setdefault(agent_id, []).append(ws)
+    try:
+        while True:
+            await ws.receive_text()  # Keep-alive, client can send pings
+    except WebSocketDisconnect:
+        _ws_connections[agent_id].remove(ws)
+
+async def push_agent_event(agent_id: str, event: dict):
+    """Push a proactive event to all connected clients for an agent."""
+    for ws in _ws_connections.get(agent_id, []):
+        try:
+            await ws.send_text(json.dumps(event))
+        except Exception:
+            pass
+
+@app.post("/api/proactive/check")
+async def check_proactive(
+    auth: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    """Check for conditions that should trigger avatar walk-up."""
+    company_id = auth["company_id"]
+
+    result = db.execute(text("""
+        SELECT t.number, t.type, t.next_due_date
+        FROM cal.tools t
+        WHERE t.company_id = :cid
+          AND (t.calibration_status = 'overdue'
+               OR (t.next_due_date IS NOT NULL AND t.next_due_date < CURRENT_DATE))
+        ORDER BY t.next_due_date ASC LIMIT 5
+    """), {"cid": company_id})
+    overdue = result.fetchall()
+
+    alerts_sent = 0
+    if overdue:
+        tool_list = ", ".join([f"{r[0]} ({r[1]})" for r in overdue[:3]])
+        message = (
+            f"Hey, I need your attention. We have {len(overdue)} overdue calibrations. "
+            f"The most urgent ones are: {tool_list}. "
+            f"Can you collect these and get them ready for calibration?"
+        )
+        await push_agent_event("calibration", {
+            "type": "attention_needed",
+            "agent_id": "calibration",
+            "message": message,
+            "priority": "high",
+        })
+        alerts_sent = 1
+
+    return {"checked": True, "overdue_count": len(overdue), "alerts_sent": alerts_sent}
+
+# ============================================================
+# EMAIL INGESTION — cal@{tenant}.gp3.app
+# ============================================================
+
+# Webhook secret for email provider (Cloudflare/Mailgun)
+EMAIL_WEBHOOK_SECRET = os.getenv("EMAIL_WEBHOOK_SECRET", "")
+
+class EmailWebhook(BaseModel):
+    """Generic inbound email webhook payload.
+    Works with Cloudflare Email Workers, Mailgun, SendGrid.
+    The email worker normalizes the provider format to this shape.
+    """
+    from_address: str
+    to_address: str
+    cc: str = ""
+    subject: str = ""
+    body_text: str = ""
+    body_html: str = ""
+    message_id: str = ""
+    in_reply_to: str = ""
+    attachments: list[dict] = []  # [{filename, content_type, size, url_or_base64}]
+    webhook_secret: str = ""
+
+def extract_tenant_from_email(to_address: str) -> str | None:
+    """Extract tenant slug from cal@{slug}.gp3.app format."""
+    match = re.match(r'cal@([^.]+)\.gp3\.app', to_address.lower().strip())
+    return match.group(1) if match else None
+
+@app.post("/api/email/ingest")
+async def ingest_email(payload: EmailWebhook, db: Session = Depends(get_db)):
+    """Receive inbound email for Cal agent.
+    Called by email webhook (Cloudflare Email Workers / Mailgun).
+    No JWT auth — secured by webhook secret.
+    """
+    # Verify webhook secret
+    if EMAIL_WEBHOOK_SECRET and payload.webhook_secret != EMAIL_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    # Extract tenant from recipient address
+    tenant_slug = extract_tenant_from_email(payload.to_address)
+    if not tenant_slug:
+        return {"status": "ignored", "reason": f"Unrecognized recipient: {payload.to_address}"}
+
+    # Look up company
+    result = db.execute(text(
+        "SELECT id FROM cal.companies WHERE slug = :slug AND is_active = true"
+    ), {"slug": tenant_slug})
+    company = result.fetchone()
+    if not company:
+        return {"status": "ignored", "reason": f"Unknown tenant: {tenant_slug}"}
+
+    company_id = company[0]
+
+    # Dedup check by Message-ID
+    if payload.message_id:
+        existing = db.execute(text(
+            "SELECT id FROM cal.email_log WHERE message_id = :mid"
+        ), {"mid": payload.message_id}).fetchone()
+        if existing:
+            return {"status": "duplicate", "email_log_id": existing[0]}
+
+    # Log the email
+    db.execute(text("""
+        INSERT INTO cal.email_log
+        (company_id, direction, from_address, to_address, cc_addresses,
+         subject, body_text, body_html, has_attachments, attachment_count,
+         message_id, in_reply_to, status)
+        VALUES (:cid, 'inbound', :from_addr, :to_addr, :cc,
+                :subject, :body_text, :body_html, :has_att, :att_count,
+                :mid, :irt, 'received')
+    """), {
+        "cid": company_id,
+        "from_addr": payload.from_address,
+        "to_addr": payload.to_address,
+        "cc": payload.cc,
+        "subject": payload.subject,
+        "body_text": payload.body_text,
+        "body_html": payload.body_html,
+        "has_att": len(payload.attachments) > 0,
+        "att_count": len(payload.attachments),
+        "mid": payload.message_id or None,
+        "irt": payload.in_reply_to or None,
+    })
+    db.commit()
+
+    # Get the email_log ID
+    log_id = db.execute(text(
+        "SELECT id FROM cal.email_log WHERE message_id = :mid ORDER BY id DESC LIMIT 1"
+    ), {"mid": payload.message_id or f"noid-{datetime.utcnow().isoformat()}"}).fetchone()
+    email_log_id = log_id[0] if log_id else None
+
+    # --- CLASSIFY AND PROCESS ---
+    # Use Claude to understand what this email is about
+    context = f"""Inbound email to calibration agent:
+From: {payload.from_address}
+Subject: {payload.subject}
+Body: {payload.body_text[:2000]}
+Attachments: {len(payload.attachments)} files ({', '.join(a.get('filename','?') for a in payload.attachments)})
+"""
+
+    classification_prompt = """Classify this email into one of these categories:
+1. CERTIFICATE — Contains a calibration certificate (PDF/image attachment)
+2. PO_NOTIFICATION — Purchase order or shipping notification for calibration services
+3. STATUS_UPDATE — Status update on equipment sent for calibration
+4. QUESTION — Someone asking a calibration-related question
+5. OTHER — Unrelated or spam
+
+Return ONLY a JSON object: {"category": "CATEGORY", "summary": "1-sentence summary", "tool_numbers": ["CAL-XXXX"] or [], "action": "suggested next action"}"""
+
+    try:
+        kernel = load_tenant_kernel(db, company_id)
+        classification = call_agent(kernel, classification_prompt, context)
+        result_data = json.loads(classification["text"]) if classification["text"].strip().startswith("{") else {"category": "OTHER", "summary": classification["text"][:200]}
+    except Exception:
+        result_data = {"category": "OTHER", "summary": "Could not classify", "error": True}
+
+    # Update email log with classification
+    db.execute(text("""
+        UPDATE cal.email_log
+        SET status = 'processed', processing_result = :result, processed_at = NOW()
+        WHERE id = :eid
+    """), {"result": json.dumps(result_data), "eid": email_log_id})
+    db.commit()
+
+    # --- ACT ON CLASSIFICATION ---
+    actions_taken = []
+
+    if result_data.get("category") == "CERTIFICATE" and payload.attachments:
+        # Process PDF attachments as calibration certificates
+        for att in payload.attachments:
+            if att.get("content_type", "").startswith(("application/pdf", "image/")):
+                actions_taken.append(f"Certificate attachment '{att.get('filename')}' queued for processing")
+                # TODO: decode base64 attachment, run through existing upload/extraction flow
+
+    elif result_data.get("category") == "PO_NOTIFICATION":
+        actions_taken.append("PO notification logged — Cal will track expected return")
+
+    elif result_data.get("category") == "STATUS_UPDATE":
+        actions_taken.append("Status update logged — Cal will update equipment records")
+
+    # Push proactive event to avatar if user is connected
+    if actions_taken:
+        summary = result_data.get("summary", "New email processed")
+        await push_agent_event("calibration", {
+            "type": "attention_needed",
+            "agent_id": "calibration",
+            "message": f"I just received an email from {payload.from_address}. {summary}",
+            "priority": "medium",
+        })
+
+    return {
+        "status": "processed",
+        "email_log_id": email_log_id,
+        "classification": result_data,
+        "actions": actions_taken,
+    }
+
+@app.post("/api/email/send")
+async def send_email(
+    req: dict,
+    auth: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+):
+    """Cal sends an outbound email from cal@{tenant}.gp3.app.
+    Uses Mailgun or SMTP relay configured via env vars.
+    """
+    import httpx
+
+    company_id = auth["company_id"]
+
+    # Get company slug for sender address
+    result = db.execute(text(
+        "SELECT slug, name FROM cal.companies WHERE id = :cid"
+    ), {"cid": company_id})
+    company = result.fetchone()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    slug, company_name = company[0], company[1]
+    sender = f"Cal - {company_name} <cal@{slug}.gp3.app>"
+    to_address = req.get("to", "")
+    subject = req.get("subject", "")
+    body = req.get("body", "")
+    cc = req.get("cc", "")
+
+    if not to_address or not subject:
+        raise HTTPException(status_code=400, detail="to and subject are required")
+
+    # Send via Mailgun HTTP API
+    mailgun_key = os.getenv("MAILGUN_API_KEY")
+    mailgun_domain = os.getenv("MAILGUN_DOMAIN", "gp3.app")
+
+    if not mailgun_key:
+        raise HTTPException(status_code=503, detail="Email sending not configured")
+
+    async with httpx.AsyncClient() as client:
+        data = {
+            "from": sender,
+            "to": to_address,
+            "subject": subject,
+            "text": body,
+        }
+        if cc:
+            data["cc"] = cc
+
+        resp = await client.post(
+            f"https://api.mailgun.net/v3/{mailgun_domain}/messages",
+            auth=("api", mailgun_key),
+            data=data,
+            timeout=15.0,
+        )
+
+    # Log the outbound email
+    db.execute(text("""
+        INSERT INTO cal.email_log
+        (company_id, direction, from_address, to_address, cc_addresses,
+         subject, body_text, status, message_id)
+        VALUES (:cid, 'outbound', :from_addr, :to_addr, :cc,
+                :subject, :body, :status, :mid)
+    """), {
+        "cid": company_id,
+        "from_addr": sender,
+        "to_addr": to_address,
+        "cc": cc,
+        "subject": subject,
+        "body": body,
+        "status": "sent" if resp.status_code == 200 else "failed",
+        "mid": resp.json().get("id", "") if resp.status_code == 200 else None,
+    })
+    db.commit()
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Email send failed: {resp.text}")
+
+    return {"status": "sent", "to": to_address, "subject": subject}
+
+@app.get("/api/email/log")
+async def get_email_log(
+    auth: dict = Depends(verify_token),
+    db: Session = Depends(get_db),
+    limit: int = 50,
+):
+    """List recent emails for the tenant."""
+    company_id = auth["company_id"]
+    result = db.execute(text("""
+        SELECT id, direction, from_address, to_address, subject,
+               status, processing_result, has_attachments,
+               received_at, processed_at
+        FROM cal.email_log
+        WHERE company_id = :cid
+        ORDER BY received_at DESC
+        LIMIT :lim
+    """), {"cid": company_id, "lim": limit})
+
+    return {
+        "emails": [
+            {
+                "id": r[0], "direction": r[1], "from": r[2], "to": r[3],
+                "subject": r[4], "status": r[5],
+                "classification": r[6], "has_attachments": r[7],
+                "received_at": str(r[8]) if r[8] else None,
+                "processed_at": str(r[9]) if r[9] else None,
+            }
+            for r in result.fetchall()
+        ],
     }
