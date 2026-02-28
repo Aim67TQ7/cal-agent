@@ -25,12 +25,12 @@ logger = logging.getLogger("cal-agent")
 app = FastAPI(
     title="cal.gp3.app - Calibration Agent",
     description="Multi-tenant calibration management powered by AI",
-    version="2.5.0",
+    version="2.6.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://cal.gp3.app", "http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["https://cal.gp3.app", "https://portal.gp3.app", "http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -497,6 +497,76 @@ async def register(req: RegisterRequest):
     })
 
     return {"status": "success", "message": "User created. Please login."}
+
+
+class PortalExchangeRequest(BaseModel):
+    supabase_token: str
+
+
+@app.post("/auth/portal-exchange")
+async def portal_exchange(req: PortalExchangeRequest):
+    """Exchange a Supabase Portal JWT for a Cal JWT. Used by portal iframe integration."""
+    # Validate the Supabase token by calling Supabase Auth API
+    try:
+        r = httpx.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {req.supabase_token}",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        sb_user = r.json()
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid portal token")
+
+    tenant_id = sb_user.get("user_metadata", {}).get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(status_code=403, detail="No tenant_id in portal token")
+
+    # Map tenant_id (string slug) -> company_id (integer)
+    companies = sb_get("companies", {"select": "id,name", "slug": f"eq.{tenant_id}"})
+    if not companies:
+        raise HTTPException(status_code=404, detail=f"No company for tenant '{tenant_id}'")
+    company = companies[0]
+
+    # Find or auto-create cal.users record for this portal user
+    email = sb_user.get("email", "")
+    existing = sb_get("users", {
+        "select": "id,role",
+        "email": f"eq.{email}",
+        "company_id": f"eq.{company['id']}",
+    })
+
+    if existing:
+        user_id = existing[0]["id"]
+        role = existing[0]["role"]
+    else:
+        # Auto-create user from portal identity (random password — portal-only auth)
+        meta = sb_user.get("user_metadata", {})
+        new_user = sb_post("users", {
+            "company_id": company["id"],
+            "email": email,
+            "password_hash": pwd_context.hash(str(uuid.uuid4())),
+            "first_name": meta.get("first_name", "Portal"),
+            "last_name": meta.get("last_name", "User"),
+            "role": "user",
+        })
+        user_id = new_user["id"]
+        role = "user"
+
+    # Issue Cal JWT (8h TTL for iframe sessions)
+    token = jwt.encode({
+        "user_id": user_id,
+        "company_id": company["id"],
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(hours=8),
+        "source": "portal",
+    }, SECRET_KEY, algorithm=ALGORITHM)
+
+    return {"token": token, "company_name": company["name"], "role": role}
+
 
 # ============================================================
 # CALIBRATION AGENT ENDPOINTS

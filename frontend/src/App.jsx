@@ -127,6 +127,216 @@ function LoginPage({ onLogin }) {
 }
 
 // ============================================================
+// ONBOARDING WIZARD — Agent introduces itself, drives setup
+// ============================================================
+function OnboardingWizard({ token, company, onComplete }) {
+  const [step, setStep] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [auditResult, setAuditResult] = useState(null)
+  const [chatMessages, setChatMessages] = useState([])
+  const [userInput, setUserInput] = useState('')
+  const inputRef = useRef()
+
+  // Step 0: Cal introduces itself
+  // Step 1: Cal runs an audit of current records
+  // Step 2: Cal shows gaps and asks for missing data
+  // Step 3: Complete — transition to main app
+
+  const runAudit = async () => {
+    setLoading(true)
+    try {
+      const res = await api(token).post('/cal/question', {
+        question: 'Run a complete audit: Count total tools, how many have calibration records with next_due_date set, how many are missing next_due_date, how many have a calibrating_entity assigned, and how many are missing it. Also count how many approved vendors we have. Give me exact numbers.'
+      })
+      setAuditResult(res.data.answer)
+    } catch (err) {
+      setAuditResult('I was unable to run the audit. Please check your connection and try again.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const sendMessage = async (msg) => {
+    if (!msg?.trim()) return
+    const userMsg = msg.trim()
+    setUserInput('')
+    setChatMessages(prev => [...prev, { role: 'user', text: userMsg }])
+    setLoading(true)
+    try {
+      const res = await api(token).post('/cal/question', { question: userMsg })
+      setChatMessages(prev => [...prev, { role: 'agent', text: res.data.answer }])
+    } catch {
+      setChatMessages(prev => [...prev, { role: 'agent', text: 'Sorry, I hit an error. Try again.' }])
+    } finally {
+      setLoading(false)
+      setTimeout(() => inputRef.current?.focus(), 100)
+    }
+  }
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      sendMessage(userInput)
+    }
+  }
+
+  return (
+    <div style={{ display: 'flex', minHeight: '100vh', alignItems: 'center', justifyContent: 'center', padding: 32 }}>
+      <div style={{ width: '100%', maxWidth: 700 }}>
+
+        {/* Step 0: Introduction */}
+        {step === 0 && (
+          <div className="card" style={{ textAlign: 'center', padding: 40 }}>
+            <div style={{ fontSize: 48, marginBottom: 16 }}>&#9881;</div>
+            <h1 style={{ fontSize: 24, fontWeight: 800, marginBottom: 8 }}>I'm Cal</h1>
+            <div style={{ fontSize: 14, color: 'var(--text-muted)', marginBottom: 24 }}>
+              {company} Calibration Agent
+            </div>
+            <div style={{ fontSize: 15, lineHeight: 1.8, textAlign: 'left', maxWidth: 560, margin: '0 auto 32px', color: 'var(--text)' }}>
+              <p style={{ marginBottom: 16 }}>
+                <strong>I'm not a dashboard.</strong> I'm your calibration program manager. Here's what I do:
+              </p>
+              <ul style={{ paddingLeft: 20, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <li><strong>Enforce calibration schedules</strong> — I email your team when tools are due, overdue, or need purchasing action. Every day, automatically.</li>
+                <li><strong>Track NIST traceability</strong> — Every tool traces back to a calibrating entity and national standard. No gaps.</li>
+                <li><strong>Answer questions in plain English</strong> — "What gaussmeters are due?" "Who calibrates our bore gages?" I query live data, never guess.</li>
+                <li><strong>Generate audit evidence</strong> — Branded PDF packages ready for ISO auditors.</li>
+                <li><strong>Process certificates</strong> — Upload a cal cert and I extract the data automatically.</li>
+              </ul>
+              <p style={{ marginTop: 20, fontWeight: 600, color: 'var(--accent)' }}>
+                But first — I need to make sure your calibration records are complete. Let me run an audit.
+              </p>
+            </div>
+            <button onClick={() => { setStep(1); runAudit() }} style={{ fontSize: 16, padding: '12px 40px' }}>
+              Run Records Audit
+            </button>
+          </div>
+        )}
+
+        {/* Step 1: Audit results */}
+        {step === 1 && (
+          <div className="card" style={{ padding: 32 }}>
+            <h2 style={{ fontSize: 20, marginBottom: 20 }}>Records Audit</h2>
+            {loading && !auditResult && (
+              <div style={{ textAlign: 'center', padding: 40, color: 'var(--accent)' }}>
+                <div style={{ fontSize: 18, marginBottom: 8 }}>Auditing your calibration records...</div>
+                <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>Checking every tool for completeness, traceability, and compliance.</div>
+              </div>
+            )}
+            {auditResult && (
+              <>
+                <div style={{
+                  background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8,
+                  padding: 20, fontSize: 14, lineHeight: 1.8, whiteSpace: 'pre-wrap', marginBottom: 24
+                }}>
+                  {auditResult}
+                </div>
+                <div style={{ fontSize: 14, lineHeight: 1.6, marginBottom: 20, color: 'var(--text)' }}>
+                  <strong>What I need from you:</strong> For every tool missing a calibration record, I need either a calibration certificate (PDF/image) or the following information:
+                </div>
+                <ul style={{ fontSize: 14, lineHeight: 1.8, paddingLeft: 20, marginBottom: 24, color: 'var(--text-muted)' }}>
+                  <li>Last calibration date and next due date</li>
+                  <li>Who performed the calibration (technician or lab)</li>
+                  <li>Pass/fail result and certificate number</li>
+                  <li>Calibrating entity and their NIST traceability</li>
+                </ul>
+                <div style={{ display: 'flex', gap: 12 }}>
+                  <button onClick={() => setStep(2)} style={{ flex: 1 }}>
+                    Let's Start Filling Gaps
+                  </button>
+                  <button onClick={onComplete} className="btn-secondary" style={{ flex: 1 }}>
+                    I'll Do This Later — Go to Main App
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Step 2: Interactive gap-filling conversation */}
+        {step === 2 && (
+          <div className="card" style={{ padding: 0, display: 'flex', flexDirection: 'column', height: '80vh' }}>
+            <div style={{
+              padding: '16px 24px', borderBottom: '1px solid var(--border)',
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+            }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 700 }}>Cal — Record Completion</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                  Ask me questions, tell me about your tools, or upload certificates
+                </div>
+              </div>
+              <button onClick={onComplete} className="btn-secondary" style={{ fontSize: 12, padding: '6px 16px' }}>
+                Go to Main App
+              </button>
+            </div>
+
+            {/* Chat messages */}
+            <div style={{ flex: 1, overflow: 'auto', padding: 24, display: 'flex', flexDirection: 'column', gap: 16 }}>
+              {/* Agent opener */}
+              <div style={{
+                background: 'rgba(79,140,255,0.08)', borderRadius: 12, padding: 16,
+                fontSize: 14, lineHeight: 1.7, maxWidth: '85%'
+              }}>
+                Let's get your records complete. You can:
+                <ul style={{ marginTop: 8, paddingLeft: 18 }}>
+                  <li><strong>Upload certificates</strong> — use the upload area below</li>
+                  <li><strong>Tell me calibration dates</strong> — e.g., "Tool 103 was calibrated Jan 15 2026 by Precision Cal, passes, due Jan 15 2027"</li>
+                  <li><strong>Ask what's missing</strong> — e.g., "Which snap gages have no cal records?"</li>
+                </ul>
+                What would you like to start with?
+              </div>
+
+              {chatMessages.map((msg, i) => (
+                <div key={i} style={{
+                  alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                  background: msg.role === 'user' ? 'var(--accent)' : 'rgba(79,140,255,0.08)',
+                  color: msg.role === 'user' ? 'white' : 'var(--text)',
+                  borderRadius: 12, padding: '12px 16px',
+                  fontSize: 14, lineHeight: 1.6, maxWidth: '85%',
+                  whiteSpace: 'pre-wrap',
+                }}>
+                  {msg.text}
+                </div>
+              ))}
+
+              {loading && (
+                <div style={{
+                  alignSelf: 'flex-start', background: 'rgba(79,140,255,0.08)',
+                  borderRadius: 12, padding: '12px 16px', fontSize: 14, color: 'var(--text-muted)',
+                }}>
+                  Thinking...
+                </div>
+              )}
+            </div>
+
+            {/* Input */}
+            <div style={{ padding: 16, borderTop: '1px solid var(--border)', display: 'flex', gap: 10 }}>
+              <textarea
+                ref={inputRef}
+                placeholder="Tell me about a calibration, ask what's missing, or describe what you need..."
+                value={userInput}
+                onChange={e => setUserInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                style={{ flex: 1, minHeight: 50, maxHeight: 120, resize: 'vertical' }}
+                autoFocus
+              />
+              <button
+                onClick={() => sendMessage(userInput)}
+                disabled={loading || !userInput.trim()}
+                style={{ alignSelf: 'flex-end', minWidth: 80 }}
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
 // DASHBOARD
 // ============================================================
 function Dashboard({ data }) {
@@ -452,8 +662,8 @@ function EquipmentPage({ token }) {
       await api(token).post('/cal/equipment', form)
       setShowAdd(false)
       setForm({
-        number: '', type: '', description: '', manufacturer: '', model: '',
-        serial_number: '', location: '', building: '', frequency: 'annual', ownership: '',
+        asset_tag: '', tool_name: '', tool_type: '', calibration_method: '', manufacturer: '', model: '',
+        serial_number: '', location: '', building: '', cal_interval_days: 365, notes: '',
       })
       loadEquipment()
     } catch { }
@@ -546,12 +756,29 @@ const NAV = [
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem('cal_token'))
   const [company, setCompany] = useState(localStorage.getItem('cal_company'))
+  const [onboarded, setOnboarded] = useState(localStorage.getItem('cal_onboarded') === 'true')
+  const [isEmbedded, setIsEmbedded] = useState(false)
   const [page, setPage] = useState('dashboard')
   const [dashData, setDashData] = useState(null)
 
+  // Portal iframe injection: read token from URL params
   useEffect(() => {
-    if (token) loadDashboard()
-  }, [token])
+    const params = new URLSearchParams(window.location.search)
+    const portalToken = params.get('portal_token')
+    const companyName = params.get('company')
+    if (portalToken) {
+      setToken(portalToken)
+      setCompany(companyName || 'Company')
+      setOnboarded(true)
+      setIsEmbedded(window.self !== window.top)
+      // Clean token from URL bar (security)
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (token && onboarded) loadDashboard()
+  }, [token, onboarded])
 
   const loadDashboard = async () => {
     try {
@@ -567,14 +794,23 @@ export default function App() {
     localStorage.setItem('cal_company', data.company_name)
   }
 
+  const handleOnboardingComplete = () => {
+    setOnboarded(true)
+    localStorage.setItem('cal_onboarded', 'true')
+  }
+
   const handleLogout = () => {
     setToken(null)
     setCompany(null)
+    setOnboarded(false)
     localStorage.removeItem('cal_token')
     localStorage.removeItem('cal_company')
+    localStorage.removeItem('cal_onboarded')
   }
 
   if (!token) return <LoginPage onLogin={handleLogin} />
+
+  if (!onboarded) return <OnboardingWizard token={token} company={company} onComplete={handleOnboardingComplete} />
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh' }}>
@@ -583,10 +819,18 @@ export default function App() {
         width: 220, background: 'var(--surface)', borderRight: '1px solid var(--border)',
         display: 'flex', flexDirection: 'column', padding: '20px 0',
       }}>
-        <div style={{ padding: '0 20px', marginBottom: 30 }}>
-          <div style={{ fontSize: 16, fontWeight: 800 }}>cal.gp3.app</div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>{company}</div>
-        </div>
+        {!isEmbedded && (
+          <div style={{ padding: '0 20px', marginBottom: 30 }}>
+            <div style={{ fontSize: 16, fontWeight: 800 }}>cal.gp3.app</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>{company}</div>
+          </div>
+        )}
+        {isEmbedded && (
+          <div style={{ padding: '0 20px', marginBottom: 30 }}>
+            <div style={{ fontSize: 14, fontWeight: 700 }}>Calibration</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>{company}</div>
+          </div>
+        )}
 
         <nav style={{ flex: 1 }}>
           {NAV.map(item => (
@@ -606,11 +850,13 @@ export default function App() {
           ))}
         </nav>
 
-        <div style={{ padding: '0 20px' }}>
-          <button className="btn-secondary" onClick={handleLogout} style={{ width: '100%', fontSize: 13 }}>
-            Sign Out
-          </button>
-        </div>
+        {!isEmbedded && (
+          <div style={{ padding: '0 20px' }}>
+            <button className="btn-secondary" onClick={handleLogout} style={{ width: '100%', fontSize: 13 }}>
+              Sign Out
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Main Content */}
