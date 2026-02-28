@@ -7,13 +7,16 @@ from anthropic import Anthropic
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 import os
 import re
 import io
 import uuid
 import json
+import logging
+
+logger = logging.getLogger("cal-agent")
 
 # ============================================================
 # APP SETUP
@@ -22,7 +25,7 @@ import json
 app = FastAPI(
     title="cal.gp3.app - Calibration Agent",
     description="Multi-tenant calibration management powered by AI",
-    version="2.4.0",
+    version="2.5.0",
 )
 
 app.add_middleware(
@@ -125,6 +128,7 @@ class EquipmentCreate(BaseModel):
     tool_name: str = ""
     tool_type: str = ""
     calibration_method: str = ""
+    calibrating_entity: str = ""
     manufacturer: str = ""
     model: str = ""
     serial_number: str = ""
@@ -601,8 +605,10 @@ cal.tools — Equipment registry
   id, company_id, asset_tag (tool identifier), tool_name (equipment name/description),
   tool_type (equipment category: Snap Gage, Micrometer, Caliper, Gaussmeter, etc.),
   calibration_method (In-House Calibrated or Vendor Calibrated),
+  calibrating_entity (lab or entity that calibrates this tool),
+  cal_vendor_id (FK→vendors.id — link to approved calibration provider),
   manufacturer, model, serial_number, location, building,
-  cal_interval_days (integer), calibration_status (current/expiring_soon/overdue),
+  cal_interval_days (integer), calibration_status (current/expiring_soon/critical/overdue),
   active (boolean), last_calibration_date, next_due_date, notes
 
 cal.calibrations — Calibration records
@@ -610,8 +616,13 @@ cal.calibrations — Calibration records
   next_calibration_date, performed_by (technician or vendor), notes,
   result_score, cost, vendor_id (FK→vendors.id)
 
-cal.vendors — Approved calibration vendors
-  id, company_id, vendor_name, contact_email, phone, accreditation, approved, notes
+cal.vendors — Approved calibration vendors (NIST traceable)
+  id, company_id, vendor_name, contact_email, phone,
+  accreditation (general), accreditation_number (ISO/IEC 17025 cert #),
+  accreditation_body (A2LA, NVLAP, ANAB, etc.),
+  nist_traceable (boolean — confirms NIST traceability chain),
+  scope_of_accreditation (what they can calibrate),
+  approved (boolean), notes
 
 cal.attachments — Uploaded certificates
   id, tool_id, calibration_id, filename, original_name, file_size, mime_type, uploaded_at
@@ -624,6 +635,8 @@ IMPORTANT:
 - tool_type contains equipment category (e.g., 'Snap Gage', 'Micrometer', 'Gaussmeter')
 - Use tool_type for category filtering: WHERE tool_type = 'Snap Gage'
 - Use tool_name ILIKE for fuzzy name search: WHERE tool_name ILIKE '%digital%'
+- calibrating_entity shows who calibrates the tool (lab name or 'In-House')
+- JOIN cal.vendors via cal_vendor_id for NIST traceability details
 - Always include WHERE company_id = :cid for tools/email_log, or JOIN through tools for calibrations.
 - Only SELECT queries allowed. Never UPDATE/DELETE/INSERT.
 """
@@ -715,9 +728,12 @@ DATABASE SCHEMA:
 
 {f"CONVERSATION MEMORY (past interactions with this tenant):{chr(10)}{memory_context}" if memory_context else ""}
 
+TODAY: {date.today().isoformat()}
+
 INSTRUCTIONS:
 - You are Cal, speaking conversationally in first person. Keep responses concise for voice output.
 - CRITICAL GROUNDING RULE: You MUST call query_calibration_db BEFORE answering ANY question about equipment, counts, dates, status, or compliance. NEVER answer from memory or the equipment list above — ALWAYS verify with a live query. If you answer without querying first, you will give wrong data.
+- Today's date is {date.today().isoformat()}. Use this for all date calculations and comparisons. Do NOT assume any other year.
 - Use tool_type for equipment category (e.g., WHERE tool_type = 'Caliper' or tool_type = 'Snap Gage').
 - Use tool_name ILIKE for fuzzy name search. Use asset_tag for tool ID lookup.
 - If the user asks about specific equipment, search by asset_tag, tool_type, tool_name, or manufacturer.
@@ -892,7 +908,7 @@ async def list_equipment(
     company_id = auth["company_id"]
 
     tools = sb_get("tools", {
-        "select": "id,asset_tag,tool_name,tool_type,calibration_method,manufacturer,model,serial_number,location,building,cal_interval_days,notes,calibration_status,active,last_calibration_date,next_due_date",
+        "select": "id,asset_tag,tool_name,tool_type,calibration_method,calibrating_entity,cal_vendor_id,manufacturer,model,serial_number,location,building,cal_interval_days,notes,calibration_status,active,last_calibration_date,next_due_date",
         "company_id": f"eq.{company_id}",
         "order": "tool_type,asset_tag",
     })
@@ -903,6 +919,7 @@ async def list_equipment(
                 "id": t["id"], "asset_tag": t.get("asset_tag", ""),
                 "tool_name": t.get("tool_name", ""), "tool_type": t.get("tool_type", ""),
                 "calibration_method": t.get("calibration_method", ""),
+                "calibrating_entity": t.get("calibrating_entity", ""),
                 "manufacturer": t.get("manufacturer", ""),
                 "model": t.get("model", ""), "serial_number": t.get("serial_number", ""),
                 "location": t.get("location", ""), "building": t.get("building", ""),
@@ -931,6 +948,7 @@ async def add_equipment(
         "tool_name": eq.tool_name,
         "tool_type": eq.tool_type,
         "calibration_method": eq.calibration_method,
+        "calibrating_entity": eq.calibrating_entity,
         "manufacturer": eq.manufacturer,
         "model": eq.model,
         "serial_number": eq.serial_number,
@@ -1027,9 +1045,334 @@ async def health():
     return {
         "status": "healthy",
         "product": "cal.gp3.app",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+# ============================================================
+# AUTONOMOUS ENFORCEMENT — Scheduled Jobs
+# ============================================================
+
+MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
+MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "gp3.app")
+CAL_SERVICE_KEY = os.getenv("SECRET_KEY", "")  # reuse SECRET_KEY for cron auth
+
+def _send_mailgun(sender: str, to: str, subject: str, body: str, cc: str = "") -> bool:
+    """Send email via Mailgun. Returns True on success."""
+    if not MAILGUN_API_KEY:
+        logger.warning("MAILGUN_API_KEY not set — skipping email")
+        return False
+    data = {"from": sender, "to": to, "subject": subject, "html": body}
+    if cc:
+        data["cc"] = cc
+    try:
+        r = httpx.post(
+            f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
+            auth=("api", MAILGUN_API_KEY),
+            data=data,
+            timeout=15,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"Mailgun send failed: {e}")
+        return False
+
+def _log_email(company_id: int, sender: str, to: str, subject: str, body: str, status: str):
+    """Log outbound email to cal.email_log."""
+    try:
+        sb_post("email_log", {
+            "company_id": company_id,
+            "direction": "outbound",
+            "from_address": sender,
+            "to_address": to,
+            "subject": subject,
+            "body_text": body[:2000],
+            "status": status,
+        })
+    except Exception:
+        pass
+
+def _build_tool_table_html(tools: list) -> str:
+    """Build an HTML table of tools for email."""
+    rows = ""
+    for t in tools:
+        ndd = t.get("next_due_date") or t.get("next_calibration_date") or "N/A"
+        if isinstance(ndd, str) and len(ndd) > 10:
+            ndd = ndd[:10]
+        rows += f"<tr><td>{t.get('asset_tag','')}</td><td>{t.get('tool_name','')}</td><td>{t.get('tool_type','')}</td><td>{t.get('calibrating_entity','')}</td><td>{ndd}</td></tr>\n"
+    return f"""<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-family:Helvetica,sans-serif;font-size:13px;">
+<tr style="background:#003366;color:white;"><th>Asset Tag</th><th>Tool Name</th><th>Type</th><th>Calibrating Entity</th><th>Due Date</th></tr>
+{rows}</table>"""
+
+def refresh_statuses():
+    """Recalculate calibration_status for all active tools across all companies."""
+    companies = sb_get("companies", {"select": "id"})
+    today = date.today()
+    updated = 0
+    for co in companies:
+        cid = co["id"]
+        tools = sb_get("tools", {
+            "select": "id,next_due_date,calibration_status",
+            "company_id": f"eq.{cid}",
+            "active": "eq.true",
+        })
+        for t in tools:
+            ndd = t.get("next_due_date")
+            if not ndd:
+                continue
+            try:
+                due = date.fromisoformat(str(ndd)[:10])
+                days = (due - today).days
+            except (ValueError, TypeError):
+                continue
+            if days < 0:
+                new_status = "overdue"
+            elif days <= 7:
+                new_status = "critical"
+            elif days <= 30:
+                new_status = "expiring_soon"
+            else:
+                new_status = "current"
+            if t.get("calibration_status") != new_status:
+                sb_patch("tools", {"id": f"eq.{t['id']}"}, {"calibration_status": new_status})
+                updated += 1
+    logger.info(f"[CRON] refresh_statuses: updated {updated} tools")
+    return updated
+
+def enforcement_scan():
+    """Scan all companies for overdue/expiring tools and send enforcement emails."""
+    companies = sb_get("companies", {"select": "id,name,slug"})
+    today = date.today()
+    total_emails = 0
+
+    for co in companies:
+        cid, co_name, slug = co["id"], co["name"], co["slug"]
+        sender = f"Cal - {co_name} <cal@{slug}.gp3.app>"
+
+        # Load tenant kernel for routing config
+        kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
+        if not kernel_path.exists():
+            continue  # no kernel = not onboarded
+
+        tools = sb_get("tools", {
+            "select": "id,asset_tag,tool_name,tool_type,calibration_method,calibrating_entity,calibration_status,next_due_date",
+            "company_id": f"eq.{cid}",
+            "active": "eq.true",
+            "order": "next_due_date.asc.nullslast",
+        })
+
+        overdue = []
+        critical = []
+        warning = []
+        for t in tools:
+            ndd = t.get("next_due_date")
+            if not ndd:
+                continue
+            try:
+                due = date.fromisoformat(str(ndd)[:10])
+                days = (due - today).days
+            except (ValueError, TypeError):
+                continue
+            if days < 0:
+                overdue.append(t)
+            elif days <= 7:
+                critical.append(t)
+            elif days <= 30:
+                warning.append(t)
+
+        # --- OVERDUE: Demand immediate removal from service ---
+        if overdue:
+            table_html = _build_tool_table_html(overdue)
+            body = f"""<div style="font-family:Helvetica,sans-serif;">
+<h2 style="color:#CC0000;">[ACTION REQUIRED] {len(overdue)} Overdue Calibrations</h2>
+<p>The following tools have <strong>expired calibrations</strong> and must be <strong>removed from service immediately</strong> per ISO 9001 and company policy.</p>
+{table_html}
+<p style="margin-top:16px;"><strong>Required actions:</strong></p>
+<ul>
+<li>Remove all listed tools from service NOW</li>
+<li>Tag with red "OUT OF CALIBRATION" labels</li>
+<li>Schedule calibration with approved vendor immediately</li>
+<li>Document removal in quality records</li>
+</ul>
+<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent<br>This is an automated enforcement notice. Do not reply to this email.</p>
+</div>"""
+            # Bunting routing: overdue → Ryan + Brandon
+            to = "rlinton@buntingmagnetics.com"
+            cc = "bdick@buntingmagnetics.com"
+            sent = _send_mailgun(sender, to, f"[ACTION REQUIRED] {len(overdue)} Overdue Calibrations — Remove From Service", body, cc)
+            _log_email(cid, sender, to, f"[ACTION REQUIRED] {len(overdue)} Overdue Calibrations", body, "sent" if sent else "failed")
+            if sent:
+                total_emails += 1
+
+        # --- CRITICAL: Due within 7 days ---
+        if critical:
+            table_html = _build_tool_table_html(critical)
+            body = f"""<div style="font-family:Helvetica,sans-serif;">
+<h2 style="color:#CC6600;">[URGENT] {len(critical)} Calibrations Due Within 7 Days</h2>
+<p>The following tools require calibration within the next 7 days:</p>
+{table_html}
+<p><strong>Action:</strong> Schedule these calibrations immediately to avoid overdue status.</p>
+<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent</p>
+</div>"""
+            to = "bdick@buntingmagnetics.com"
+            sent = _send_mailgun(sender, to, f"[URGENT] {len(critical)} Calibrations Due Within 7 Days", body)
+            _log_email(cid, sender, to, f"[URGENT] {len(critical)} Calibrations Due Within 7 Days", body, "sent" if sent else "failed")
+            if sent:
+                total_emails += 1
+
+        # --- WARNING: Due within 30 days ---
+        if warning:
+            table_html = _build_tool_table_html(warning)
+            # Split vendor-calibrated tools for purchasing notification
+            vendor_tools = [t for t in warning if t.get("calibration_method", "").lower().startswith("vendor")]
+            body = f"""<div style="font-family:Helvetica,sans-serif;">
+<h2 style="color:#003366;">[NOTICE] {len(warning)} Calibrations Due Within 30 Days</h2>
+<p>Plan ahead — the following tools need calibration soon:</p>
+{table_html}
+<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent</p>
+</div>"""
+            to = "dsanchez@buntingmagnetics.com"
+            cc = "bdick@buntingmagnetics.com"
+            sent = _send_mailgun(sender, to, f"[NOTICE] {len(warning)} Calibrations Due Within 30 Days", body, cc)
+            _log_email(cid, sender, to, f"[NOTICE] {len(warning)} Calibrations Due Within 30 Days", body, "sent" if sent else "failed")
+            if sent:
+                total_emails += 1
+
+            # --- PURCHASING: Vendor-calibrated tools need PO ---
+            if vendor_tools:
+                vendor_table = _build_tool_table_html(vendor_tools)
+                po_body = f"""<div style="font-family:Helvetica,sans-serif;">
+<h2 style="color:#003366;">[CAL REQUEST] {len(vendor_tools)} Tools Need Vendor Calibration</h2>
+<p>The following vendor-calibrated tools are due within 30 days. Please initiate purchase orders with the listed calibrating entities:</p>
+{vendor_table}
+<p><strong>Contact the Quality Department for vendor details and shipping instructions.</strong></p>
+<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent</p>
+</div>"""
+                to = "purchasing@buntingmagnetics.com"
+                cc = "bdick@buntingmagnetics.com"
+                sent = _send_mailgun(sender, to, f"[CAL REQUEST] {len(vendor_tools)} Tools Need Vendor Calibration", po_body, cc)
+                _log_email(cid, sender, to, f"[CAL REQUEST] {len(vendor_tools)} Vendor Calibrations", po_body, "sent" if sent else "failed")
+                if sent:
+                    total_emails += 1
+
+    logger.info(f"[CRON] enforcement_scan: sent {total_emails} emails")
+    return total_emails
+
+def weekly_summary():
+    """Send weekly compliance summary to quality managers."""
+    companies = sb_get("companies", {"select": "id,name,slug"})
+    today = date.today()
+    total_emails = 0
+
+    for co in companies:
+        cid, co_name, slug = co["id"], co["name"], co["slug"]
+        sender = f"Cal - {co_name} <cal@{slug}.gp3.app>"
+
+        kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
+        if not kernel_path.exists():
+            continue
+
+        tools = sb_get("tools", {
+            "select": "id,calibration_status,next_due_date,tool_type",
+            "company_id": f"eq.{cid}",
+            "active": "eq.true",
+        })
+
+        total = len(tools)
+        counts = {"current": 0, "expiring_soon": 0, "critical": 0, "overdue": 0, "unknown": 0}
+        for t in tools:
+            s = t.get("calibration_status") or "unknown"
+            counts[s] = counts.get(s, 0) + 1
+
+        compliant = counts.get("current", 0)
+        compliance_pct = round(compliant * 100.0 / max(total, 1), 1)
+
+        # Type breakdown
+        type_counts = {}
+        for t in tools:
+            tt = t.get("tool_type") or "Uncategorized"
+            type_counts[tt] = type_counts.get(tt, 0) + 1
+        type_rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in sorted(type_counts.items(), key=lambda x: -x[1]))
+
+        body = f"""<div style="font-family:Helvetica,sans-serif;">
+<h2 style="color:#003366;">Weekly Calibration Summary — {co_name}</h2>
+<p><strong>Week of {today.isoformat()}</strong></p>
+
+<table border="1" cellpadding="8" cellspacing="0" style="border-collapse:collapse;font-size:14px;margin:16px 0;">
+<tr style="background:#003366;color:white;"><th>Metric</th><th>Value</th></tr>
+<tr><td>Total Active Tools</td><td><strong>{total}</strong></td></tr>
+<tr><td>Current (Compliant)</td><td style="color:green;"><strong>{counts['current']}</strong></td></tr>
+<tr><td>Expiring Soon (≤30d)</td><td style="color:orange;">{counts['expiring_soon']}</td></tr>
+<tr><td>Critical (≤7d)</td><td style="color:red;">{counts['critical']}</td></tr>
+<tr><td>Overdue</td><td style="color:red;font-weight:bold;">{counts['overdue']}</td></tr>
+<tr><td>Unknown / No Date</td><td>{counts['unknown']}</td></tr>
+<tr style="background:#f0f0f0;"><td><strong>Compliance Rate</strong></td><td><strong>{compliance_pct}%</strong></td></tr>
+</table>
+
+<h3>Equipment by Type</h3>
+<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+<tr style="background:#003366;color:white;"><th>Type</th><th>Count</th></tr>
+{type_rows}
+</table>
+
+<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent<br>{co_name} Quality Department</p>
+</div>"""
+        to = "rlinton@buntingmagnetics.com"
+        cc = "bdick@buntingmagnetics.com"
+        sent = _send_mailgun(sender, to, f"Weekly Calibration Summary — {compliance_pct}% Compliant", body, cc)
+        _log_email(cid, sender, to, f"Weekly Calibration Summary", body, "sent" if sent else "failed")
+        if sent:
+            total_emails += 1
+
+    logger.info(f"[CRON] weekly_summary: sent {total_emails} emails")
+    return total_emails
+
+# --- Scheduler setup ---
+from apscheduler.schedulers.background import BackgroundScheduler
+from contextlib import asynccontextmanager
+
+scheduler = BackgroundScheduler(timezone="America/Chicago")
+
+@asynccontextmanager
+async def lifespan(app):
+    # Startup: schedule autonomous jobs
+    scheduler.add_job(refresh_statuses, "cron", hour=5, minute=0, id="refresh_statuses", replace_existing=True)
+    scheduler.add_job(enforcement_scan, "cron", hour=6, minute=0, id="enforcement_scan", replace_existing=True)
+    scheduler.add_job(weekly_summary, "cron", day_of_week="mon", hour=7, minute=0, id="weekly_summary", replace_existing=True)
+    scheduler.start()
+    logger.info("[SCHEDULER] Started — refresh@05:00, enforce@06:00, summary@Mon07:00 CT")
+    yield
+    # Shutdown
+    scheduler.shutdown(wait=False)
+
+app.router.lifespan_context = lifespan
+
+# --- Manual trigger endpoint (service-key auth) ---
+@app.post("/api/cron/daily")
+async def cron_daily(req: dict = {}):
+    """Manual trigger for daily enforcement. Auth via service key in body."""
+    key = req.get("service_key", "")
+    if key != CAL_SERVICE_KEY:
+        raise HTTPException(status_code=403, detail="Invalid service key")
+
+    statuses_updated = refresh_statuses()
+    emails_sent = enforcement_scan()
+    return {
+        "status": "completed",
+        "statuses_updated": statuses_updated,
+        "emails_sent": emails_sent,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+@app.post("/api/cron/weekly")
+async def cron_weekly(req: dict = {}):
+    """Manual trigger for weekly summary. Auth via service key in body."""
+    key = req.get("service_key", "")
+    if key != CAL_SERVICE_KEY:
+        raise HTTPException(status_code=403, detail="Invalid service key")
+
+    emails_sent = weekly_summary()
+    return {"status": "completed", "emails_sent": emails_sent}
 
 # ============================================================
 # TTS PROXY (ElevenLabs)

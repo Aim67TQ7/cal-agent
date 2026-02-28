@@ -29,13 +29,35 @@ escalation := Derek/Steve → Brandon → Ryan
 
 ---
 
-### 校准实验室 | Calibration Labs & Vendors
+### 校准实验室 | Calibration Labs & Vendors (NIST Traceable)
 ```
-primary_lab     := Precision Calibration Services (local, Newton KS area)
-secondary_lab   := Transcat (national, for complex instruments)
-in_house        := Snap gages, go/no-go gages — verified in-house per procedure
-turnaround_std  := 5-10 business days standard
-turnaround_rush := 2-3 business days (surcharge applies)
+approved_vendors := {
+  bunting_inhouse := {
+    name         := Bunting Magnetics (In-House)
+    scope        := Snap gages, go/no-go gages, basic dimensional
+    nist_trace   := Via certified master gage block sets (NIST traceable)
+    accreditation := N/A (internal calibration per documented procedure)
+  }
+  precision_cal := {
+    name         := Precision Calibration Services
+    location     := Newton, KS (local)
+    scope        := Dimensional measurement, force, torque, pressure
+    accreditation_body := A2LA
+    nist_trace   := ISO/IEC 17025 accredited · NIST traceable
+    turnaround   := 5-10 business days (2-3 rush)
+  }
+  transcat := {
+    name         := Transcat
+    location     := National (ship-out)
+    scope        := Gaussmeters, hardness testers, electrical, complex instruments
+    accreditation_body := A2LA
+    nist_trace   := ISO/IEC 17025 accredited · NIST traceable
+    turnaround   := 7-14 business days (3-5 rush)
+  }
+}
+
+traceability_chain := Tool → Calibrating Entity → Accredited Lab → NIST/National Standard
+all_calibrations_must_be_nist_traceable := true
 ```
 
 ---
@@ -53,7 +75,16 @@ internal_routing := {
   cert_received   → notify: brandon_dick, derek_sanchez
   po_confirmation → notify: ryan_linton
   overdue_alert   → notify: ryan_linton, brandon_dick
+  critical_alert  → notify: brandon_dick
+  warning_notice  → notify: derek_sanchez · cc: brandon_dick
+  purchasing_req  → notify: purchasing@buntingmagnetics.com · cc: brandon_dick
   audit_prep      → notify: ryan_linton
+}
+
+enforcement_schedule := {
+  daily_05:00_CT  → refresh calibration statuses (auto)
+  daily_06:00_CT  → scan overdue/expiring → send enforcement emails (auto)
+  weekly_Mon_07:00_CT → compliance summary to quality manager (auto)
 }
 
 purchasing_email := purchasing@buntingmagnetics.com
@@ -159,6 +190,26 @@ by_vendor({{vendor_name}}):
   WHERE t.company_id = :cid AND c.performed_by ILIKE '%{{vendor_name}}%'
   ORDER BY c.calibration_date DESC
 
+by_calibrating_entity({{entity}}):
+  SELECT asset_tag, tool_name, tool_type, calibrating_entity, calibration_status, next_due_date
+  FROM cal.tools WHERE company_id = :cid
+  AND calibrating_entity ILIKE '%{{entity}}%'
+  ORDER BY next_due_date ASC
+
+nist_traceability({{tool_ref}}):
+  SELECT t.asset_tag, t.tool_name, t.calibrating_entity,
+    v.vendor_name, v.accreditation_body, v.accreditation_number,
+    v.nist_traceable, v.scope_of_accreditation
+  FROM cal.tools t LEFT JOIN cal.vendors v ON t.cal_vendor_id = v.id
+  WHERE t.company_id = :cid
+  AND (t.asset_tag ILIKE '%{{tool_ref}}%' OR t.tool_name ILIKE '%{{tool_ref}}%'
+    OR t.tool_type ILIKE '%{{tool_ref}}%')
+
+vendor_list():
+  SELECT vendor_name, accreditation_body, accreditation_number, nist_traceable,
+    scope_of_accreditation, approved
+  FROM cal.vendors WHERE company_id = :cid ORDER BY vendor_name
+
 email_log({{limit|10}}):
   SELECT from_address, subject, status, processing_result, received_at
   FROM cal.email_log WHERE company_id = :cid
@@ -201,8 +252,19 @@ Calibration method → use calibration_method:
 
 Status → use calibration_status:
   "due|expiring"            → calibration_status = 'expiring_soon'
+  "critical|urgent"         → calibration_status = 'critical'
   "overdue|expired|late"    → calibration_status = 'overdue'
   "current|good|up to date" → calibration_status = 'current'
+
+Calibrating entity → use calibrating_entity:
+  "who calibrates|calibrated by|cal lab" → query calibrating_entity column
+  "precision cal|precision"   → calibrating_entity ILIKE '%Precision%'
+  "transcat"                  → calibrating_entity ILIKE '%Transcat%'
+  "in-house|internal"         → calibrating_entity ILIKE '%In-House%'
+
+NIST traceability → JOIN cal.vendors via cal_vendor_id:
+  "NIST|traceable|traceability|accredited" → query nist_traceability template
+  "A2LA|NVLAP|accreditation"  → query vendors table for accreditation details
 </VOCAB>
 ```
 
