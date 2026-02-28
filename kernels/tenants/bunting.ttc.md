@@ -11,6 +11,7 @@ parent   := BFR Group (Bunting Family of Recyclers)
 locations := Newton, KS (HQ + manufacturing) · additional facilities
 standards := ISO 9001:2015 · customer-specific QA requirements
 timezone  := America/Chicago (CST/CDT)
+company_id := 3
 ```
 
 ---
@@ -42,10 +43,8 @@ turnaround_rush := 2-3 business days (surcharge applies)
 ### 邮件路由 | Email Routing
 ```
 cal_inbox := cal@bunting.gp3.app
-# Emails CC'd or forwarded here get auto-processed by Cal
 
 vendor_emails := {
-  # When Cal sees email FROM these addresses, classify as calibration-related
   precision_cal := *@precisioncal.com
   transcat      := *@transcat.com
 }
@@ -66,23 +65,145 @@ receiving_email  := receiving@buntingmagnetics.com
 ### 设备类别 | Equipment Categories
 ```
 measurement_types := {
-  snap_gages   → Go/no-go dimensional checks · most common category (~40 tools)
-  micrometers  → Precision dimensional measurement · outside/inside/depth
-  calipers     → Vernier/digital calipers · general dimensional
-  bore_gages   → Internal diameter measurement
-  gaussmeters  → Magnetic field strength measurement · CRITICAL for product QA
-  indicators   → Dial indicators, test indicators
-  height_gages → Precision height measurement
-  scales       → Weighing scales and balances
-  hardness     → Rockwell/Brinell hardness testers
-  force_gages  → Push/pull force measurement
+  Snap Gage    → Go/no-go dimensional checks · most common category (~40 tools)
+  Micrometer   → Precision dimensional measurement · outside/inside/depth/blade/disc/flange/thread
+  Caliper      → Vernier/digital calipers · general dimensional
+  Bore Gage    → Internal diameter measurement
+  Gaussmeter   → Magnetic field strength measurement · CRITICAL for product QA
+  Indicator    → Dial indicators, test indicators, digital gage heads
+  Height Gage  → Precision height measurement
+  Scale        → Weighing scales and balances
+  Hardness Tester → Rockwell/Brinell hardness, durometers
+  Force Gage   → Push/pull force measurement
+  Gage Block Set → Ceramic gage blocks for reference
+  Surface Plate → Granite inspection tables
+  Probe        → Gauss probes (axial, transverse)
 }
 
 critical_equipment := {
-  gaussmeters    → Core product verification — CANNOT ship without current cal
-  hardness_tester → Material certification requirement
-  CMM            → If present, complex calibration, 2-week lead time
+  Gaussmeter      → Core product verification — CANNOT ship without current cal
+  Hardness Tester → Material certification requirement
 }
+```
+
+---
+
+### 查询模板 | Query Templates (Parameterized)
+```xml
+<QUERY_TEMPLATES note="Use {{var}} params — adapt to user question">
+
+find_by_category({{category}}):
+  SELECT asset_tag, tool_name, tool_type, manufacturer, calibration_status, next_due_date
+  FROM cal.tools WHERE company_id = :cid
+  AND tool_type = '{{category}}'
+  ORDER BY next_due_date ASC
+
+find_by_category_fuzzy({{term}}):
+  SELECT asset_tag, tool_name, tool_type, manufacturer, calibration_status, next_due_date
+  FROM cal.tools WHERE company_id = :cid
+  AND (tool_type ILIKE '%{{term}}%' OR tool_name ILIKE '%{{term}}%')
+  ORDER BY next_due_date ASC
+
+find_by_method({{method}}):
+  SELECT asset_tag, tool_name, tool_type, calibration_method, calibration_status
+  FROM cal.tools WHERE company_id = :cid
+  AND calibration_method ILIKE '%{{method}}%'
+  ORDER BY tool_type, asset_tag
+
+due_within({{days}}):
+  SELECT asset_tag, tool_name, tool_type, next_due_date, calibration_status
+  FROM cal.tools WHERE company_id = :cid
+  AND next_due_date BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '{{days}} days')
+  ORDER BY next_due_date ASC
+
+overdue():
+  SELECT asset_tag, tool_name, tool_type, next_due_date, calibration_status
+  FROM cal.tools WHERE company_id = :cid
+  AND (calibration_status = 'overdue'
+    OR (next_due_date IS NOT NULL AND next_due_date < CURRENT_DATE))
+  ORDER BY next_due_date ASC
+
+compliance():
+  SELECT calibration_status, COUNT(*) as cnt
+  FROM cal.tools WHERE company_id = :cid
+  GROUP BY calibration_status
+
+inventory():
+  SELECT tool_type, COUNT(*) as cnt
+  FROM cal.tools WHERE company_id = :cid
+  GROUP BY tool_type ORDER BY cnt DESC
+
+by_location({{location_term}}):
+  SELECT asset_tag, tool_name, tool_type, location, building, calibration_status
+  FROM cal.tools WHERE company_id = :cid
+  AND (location ILIKE '%{{location_term}}%' OR building ILIKE '%{{location_term}}%')
+  ORDER BY tool_type
+
+cal_history({{tool_ref}}):
+  SELECT c.calibration_date, c.result, c.performed_by, c.next_calibration_date, c.notes
+  FROM cal.calibrations c JOIN cal.tools t ON c.tool_id = t.id
+  WHERE t.company_id = :cid
+  AND (t.asset_tag ILIKE '%{{tool_ref}}%' OR t.tool_name ILIKE '%{{tool_ref}}%')
+  ORDER BY c.calibration_date DESC
+
+last_cal({{tool_ref}}):
+  SELECT t.asset_tag, t.tool_name, c.performed_by, c.calibration_date, c.result
+  FROM cal.calibrations c JOIN cal.tools t ON c.tool_id = t.id
+  WHERE t.company_id = :cid
+  AND (t.asset_tag ILIKE '%{{tool_ref}}%' OR t.tool_name ILIKE '%{{tool_ref}}%')
+  ORDER BY c.calibration_date DESC LIMIT 1
+
+by_vendor({{vendor_name}}):
+  SELECT t.asset_tag, t.tool_name, c.calibration_date, c.result
+  FROM cal.calibrations c JOIN cal.tools t ON c.tool_id = t.id
+  WHERE t.company_id = :cid AND c.performed_by ILIKE '%{{vendor_name}}%'
+  ORDER BY c.calibration_date DESC
+
+email_log({{limit|10}}):
+  SELECT from_address, subject, status, processing_result, received_at
+  FROM cal.email_log WHERE company_id = :cid
+  ORDER BY received_at DESC LIMIT {{limit}}
+
+</QUERY_TEMPLATES>
+```
+
+---
+
+### 術語映射 | Vocabulary → Column Mapping
+```xml
+<VOCAB note="Maps user speech to correct column + match pattern">
+Equipment category → use tool_type (exact match preferred):
+  "snap gage|snap gauge"    → tool_type = 'Snap Gage'
+  "mic|micrometer"          → tool_type ILIKE '%Micrometer%'
+  "caliper"                 → tool_type = 'Caliper'
+  "bore gage|bore gauge"    → tool_type = 'Bore Gage'
+  "gauss|gaussmeter"        → tool_type = 'Gaussmeter'
+  "indicator"               → tool_type = 'Indicator'
+  "height gage"             → tool_type = 'Height Gage'
+  "pin gage"                → tool_type = 'Pin Gage'
+  "thread gage"             → tool_type = 'Thread Gage'
+  "ring gage"               → tool_type = 'Ring Gage'
+  "gage block"              → tool_type = 'Gage Block Set'
+  "scale|balance"           → tool_type = 'Scale'
+  "hardness|durometer"      → tool_type = 'Hardness Tester'
+  "force gage"              → tool_type = 'Force Gage'
+  "probe"                   → tool_type = 'Probe'
+  "surface plate|granite"   → tool_type = 'Surface Plate'
+
+Equipment name detail → use tool_name ILIKE:
+  "digital"                 → tool_name ILIKE '%digital%'
+  "ceramic"                 → tool_name ILIKE '%ceramic%'
+  specific range "0-1"      → tool_name ILIKE '%0.0-1.0%'
+
+Calibration method → use calibration_method:
+  "in-house|internal"       → calibration_method ILIKE '%In-House%'
+  "vendor|external|outside" → calibration_method ILIKE '%Vendor%'
+
+Status → use calibration_status:
+  "due|expiring"            → calibration_status = 'expiring_soon'
+  "overdue|expired|late"    → calibration_status = 'overdue'
+  "current|good|up to date" → calibration_status = 'current'
+</VOCAB>
 ```
 
 ---
@@ -96,99 +217,12 @@ audit_prep_lead_days    := 30
 cert_retention_years    := 3 (minimum)
 overdue_policy          := Remove from service immediately · no exceptions
 gage_labels             := Green (current) · Yellow (expiring <30d) · Red (overdue/OOS)
+alert_thresholds        := {warn_d: 30, critical_d: 7, overdue_d: 0}
 ```
 
 ---
 
-### 典型问题·SQL映射 | Typical Questions → SQL Patterns
-```
-# These patterns help Cal construct accurate SQL queries for common Bunting questions
-
-用户问 "what snap gages are due?" →
-  SELECT number, description, next_due_date, calibration_status
-  FROM cal.tools WHERE company_id = :cid
-  AND type ILIKE '%snap%' AND (calibration_status = 'expiring_soon' OR calibration_status = 'overdue')
-  ORDER BY next_due_date ASC
-
-用户问 "show me all gaussmeters" →
-  SELECT number, description, manufacturer, calibration_status, last_calibration_date, next_due_date
-  FROM cal.tools WHERE company_id = :cid
-  AND (type ILIKE '%gauss%' OR description ILIKE '%gauss%')
-  ORDER BY number
-
-用户问 "what's overdue?" →
-  SELECT number, type, description, next_due_date, calibration_status
-  FROM cal.tools WHERE company_id = :cid
-  AND (calibration_status = 'overdue' OR (next_due_date IS NOT NULL AND next_due_date < CURRENT_DATE))
-  ORDER BY next_due_date ASC
-
-用户问 "compliance rate" / "how are we doing?" →
-  SELECT calibration_status, COUNT(*) as cnt
-  FROM cal.tools WHERE company_id = :cid
-  GROUP BY calibration_status
-
-用户问 "what's in building X?" / "what's on the floor?" →
-  SELECT number, type, description, location, building, calibration_status
-  FROM cal.tools WHERE company_id = :cid
-  AND (location ILIKE '%{user_term}%' OR building ILIKE '%{user_term}%')
-  ORDER BY type, number
-
-用户问 "calibration history for [tool]" →
-  SELECT c.calibration_date, c.result, c.technician, c.next_due_date, c.comments
-  FROM cal.calibrations c JOIN cal.tools t ON c.tool_id = t.id
-  WHERE t.company_id = :cid AND (t.number ILIKE '%{tool_ref}%' OR t.description ILIKE '%{tool_ref}%')
-  ORDER BY c.calibration_date DESC
-
-用户问 "who calibrated [tool] last?" →
-  SELECT t.number, c.technician, c.calibration_date, c.result
-  FROM cal.calibrations c JOIN cal.tools t ON c.tool_id = t.id
-  WHERE t.company_id = :cid AND t.number ILIKE '%{tool_ref}%'
-  ORDER BY c.calibration_date DESC LIMIT 1
-
-用户问 "what did we get from [vendor]?" →
-  SELECT t.number, t.type, c.calibration_date, c.result, c.technician
-  FROM cal.calibrations c JOIN cal.tools t ON c.tool_id = t.id
-  WHERE t.company_id = :cid AND c.technician ILIKE '%{vendor_name}%'
-  ORDER BY c.calibration_date DESC
-
-用户问 "how many tools do we have?" →
-  SELECT type, COUNT(*) as cnt FROM cal.tools
-  WHERE company_id = :cid GROUP BY type ORDER BY cnt DESC
-
-用户问 "what needs to go out this month?" →
-  SELECT number, type, description, next_due_date
-  FROM cal.tools WHERE company_id = :cid
-  AND next_due_date BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '30 days')
-  ORDER BY next_due_date ASC
-
-用户问 "any emails about calibration?" →
-  SELECT from_address, subject, status, processing_result, received_at
-  FROM cal.email_log WHERE company_id = :cid
-  ORDER BY received_at DESC LIMIT 10
-```
-
----
-
-### 术语 | Tenant Vocabulary
-```
-# Bunting-specific terms and informal names
-"snap gage"    = type ILIKE '%snap%'
-"mic"          = type ILIKE '%micrometer%'
-"digital"      = description ILIKE '%digital%'
-"indicator"    = type ILIKE '%indicator%'
-"bore gage"    = type ILIKE '%bore%'
-"caliper"      = type ILIKE '%caliper%'
-"gauss meter"  = type ILIKE '%gauss%' OR description ILIKE '%gauss%'
-"pin gage"     = type ILIKE '%pin%'
-"thread gage"  = type ILIKE '%thread%'
-"height gage"  = type ILIKE '%height%'
-"ring gage"    = type ILIKE '%ring%'
-"scale"        = type ILIKE '%scale%' OR type ILIKE '%balance%'
-```
-
----
-
-### 品牌标识 | Branding
+### 品牌標識 | Branding
 ```
 logo_file     := bunting-logo.png
 primary_color := #003366
@@ -204,11 +238,11 @@ report_footer := "Confidential — Bunting Magnetics Quality Department"
 
 ---
 
-### 注意事项 | Special Notes
+### 注意事項 | Special Notes
 ```
 # Gaussmeters are business-critical — always flag if overdue
 # Snap gages are the highest-volume category — collect in batches for vendor pickup
 # Brandon handles day-to-day cal coordination, Ryan is management escalation
 # Building/location data may be sparse — don't assume if not in records
-# Some legacy tools have manufacturer-assigned numbers, not internal IDs
+# Some legacy tools have manufacturer-assigned asset_tags, not internal IDs
 ```

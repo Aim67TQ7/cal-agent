@@ -22,7 +22,7 @@ import json
 app = FastAPI(
     title="cal.gp3.app - Calibration Agent",
     description="Multi-tenant calibration management powered by AI",
-    version="2.3.0",
+    version="2.4.0",
 )
 
 app.add_middleware(
@@ -121,16 +121,17 @@ class DownloadRequest(BaseModel):
     format: str = "pdf"
 
 class EquipmentCreate(BaseModel):
-    number: str
-    type: str = ""
-    description: str = ""
+    asset_tag: str
+    tool_name: str = ""
+    tool_type: str = ""
+    calibration_method: str = ""
     manufacturer: str = ""
     model: str = ""
     serial_number: str = ""
     location: str = ""
     building: str = ""
-    frequency: str = "annual"
-    ownership: str = ""
+    cal_interval_days: int = 365
+    notes: str = ""
 
 # ============================================================
 # DEPENDENCIES
@@ -183,15 +184,15 @@ def load_tenant_kernel(db_unused, company_id: int) -> str:
     # Get equipment registry via REST
     try:
         equipment = sb_get("tools", {
-            "select": "number,type,frequency,ownership,description",
+            "select": "asset_tag,tool_name,tool_type,calibration_method,cal_interval_days",
             "company_id": f"eq.{company_id}",
-            "order": "type,number",
+            "order": "tool_type,asset_tag",
         })
     except Exception:
         equipment = []
 
     equipment_list = "\n".join([
-        f"  {eq.get('number','')}: type={eq.get('type','')} | freq={eq.get('frequency','')} | owner={eq.get('ownership','')} | {eq.get('description','')}"
+        f"  {eq.get('asset_tag','')}: {eq.get('tool_type','')} | method={eq.get('calibration_method','')} | interval={eq.get('cal_interval_days','')}d | {eq.get('tool_name','')}"
         for eq in equipment
     ]) or "  No equipment registered yet."
 
@@ -376,12 +377,12 @@ def generate_branded_pdf(branding: dict, records: list, evidence_type: str, ai_s
     # Equipment detail table
     if records:
         elements.append(Paragraph("Calibration Records", styles["SectionHead"]))
-        header = ["Tool #", "Type", "Manufacturer", "Cal Date", "Next Due", "Status", "Result"]
+        header = ["Asset Tag", "Equipment Type", "Manufacturer", "Cal Date", "Next Due", "Status", "Result"]
         table_data = [header]
         for r in records:
             status_display = str(r.get("calibration_status") or "").replace("_", " ").title()
             table_data.append([
-                str(r.get("number", "")), str(r.get("type", "")),
+                str(r.get("asset_tag", "")), str(r.get("tool_type", "")),
                 str(r.get("manufacturer", "")),
                 str(r.get("last_calibration_date") or ""),
                 str(r.get("next_due_date") or ""),
@@ -546,7 +547,7 @@ Return ONLY a valid JSON object:
     tools = sb_get("tools", {
         "select": "id",
         "company_id": f"eq.{company_id}",
-        "number": f"eq.{data.get('tool_number', '')}",
+        "asset_tag": f"eq.{data.get('tool_number', '')}",
     })
 
     if not tools:
@@ -560,13 +561,13 @@ Return ONLY a valid JSON object:
 
     # Insert calibration record via REST
     cal_record = sb_post("calibrations", {
-        "record_number": f"CAL-{datetime.utcnow().strftime('%Y%m%d')}-{tool_id}",
+        "cert_number": f"CAL-{datetime.utcnow().strftime('%Y%m%d')}-{tool_id}",
         "tool_id": tool_id,
         "calibration_date": data.get("calibration_date"),
         "result": data.get("result", "pass"),
-        "next_due_date": data.get("next_due_date"),
-        "technician": data.get("technician", ""),
-        "comments": data.get("comments", ""),
+        "next_calibration_date": data.get("next_due_date"),
+        "performed_by": data.get("technician", ""),
+        "notes": data.get("comments", ""),
     })
 
     # Insert attachment record via REST
@@ -597,13 +598,20 @@ CAL_SCHEMA_REF = """
 Available tables (all in cal schema, always filter by company_id = :cid):
 
 cal.tools — Equipment registry
-  id, company_id, number, serial_number, manufacturer, model, description,
-  type, frequency, calibration_status, tool_status, location, building,
-  ownership, last_calibration_date, next_due_date
+  id, company_id, asset_tag (tool identifier), tool_name (equipment name/description),
+  tool_type (equipment category: Snap Gage, Micrometer, Caliper, Gaussmeter, etc.),
+  calibration_method (In-House Calibrated or Vendor Calibrated),
+  manufacturer, model, serial_number, location, building,
+  cal_interval_days (integer), calibration_status (current/expiring_soon/overdue),
+  active (boolean), last_calibration_date, next_due_date, notes
 
 cal.calibrations — Calibration records
-  id, record_number, tool_id (FK→tools.id), calibration_date, result,
-  next_due_date, technician, comments
+  id, cert_number, tool_id (FK→tools.id), calibration_date, result (pass/fail),
+  next_calibration_date, performed_by (technician or vendor), notes,
+  result_score, cost, vendor_id (FK→vendors.id)
+
+cal.vendors — Approved calibration vendors
+  id, company_id, vendor_name, contact_email, phone, accreditation, approved, notes
 
 cal.attachments — Uploaded certificates
   id, tool_id, calibration_id, filename, original_name, file_size, mime_type, uploaded_at
@@ -612,8 +620,12 @@ cal.email_log — Inbound/outbound email tracking
   id, company_id, direction, from_address, to_address, subject, body_text,
   status, processing_result, tool_id, calibration_id, message_id, received_at
 
-IMPORTANT: Use ILIKE with % wildcards for fuzzy text matching. Always include WHERE company_id = :cid for tools/email_log, or JOIN through tools for calibrations.
-Only SELECT queries allowed. Never UPDATE/DELETE/INSERT.
+IMPORTANT:
+- tool_type contains equipment category (e.g., 'Snap Gage', 'Micrometer', 'Gaussmeter')
+- Use tool_type for category filtering: WHERE tool_type = 'Snap Gage'
+- Use tool_name ILIKE for fuzzy name search: WHERE tool_name ILIKE '%digital%'
+- Always include WHERE company_id = :cid for tools/email_log, or JOIN through tools for calibrations.
+- Only SELECT queries allowed. Never UPDATE/DELETE/INSERT.
 """
 
 # Claude tools definition for SQL lookup
@@ -706,8 +718,9 @@ DATABASE SCHEMA:
 INSTRUCTIONS:
 - You are Cal, speaking conversationally in first person. Keep responses concise for voice output.
 - Use the query_calibration_db tool to look up specific data before answering.
-- Use ILIKE with % wildcards for fuzzy matching (e.g., WHERE type ILIKE '%caliper%').
-- If the user asks about specific equipment, search by number, type, manufacturer, or description.
+- Use tool_type for equipment category (e.g., WHERE tool_type = 'Caliper' or tool_type = 'Snap Gage').
+- Use tool_name ILIKE for fuzzy name search. Use asset_tag for tool ID lookup.
+- If the user asks about specific equipment, search by asset_tag, tool_type, tool_name, or manufacturer.
 - Always cite specific data from query results — never make up numbers or dates.
 - If no data is found, say so honestly.
 - Short sentences. This is spoken aloud, not a report.
@@ -808,9 +821,9 @@ async def generate_evidence(
 
     # Fetch tools via REST
     params = {
-        "select": "number,type,manufacturer,serial_number,last_calibration_date,next_due_date,calibration_status,location",
+        "select": "asset_tag,tool_name,tool_type,manufacturer,serial_number,last_calibration_date,next_due_date,calibration_status,location",
         "company_id": f"eq.{company_id}",
-        "order": "type,number",
+        "order": "tool_type,asset_tag",
     }
     if req.evidence_type == "overdue":
         params["calibration_status"] = "eq.overdue"
@@ -821,7 +834,8 @@ async def generate_evidence(
 
     records = [
         {
-            "number": t.get("number", ""), "type": t.get("type", ""),
+            "asset_tag": t.get("asset_tag", ""), "tool_type": t.get("tool_type", ""),
+            "tool_name": t.get("tool_name", ""),
             "manufacturer": t.get("manufacturer", ""),
             "serial_number": t.get("serial_number", ""),
             "last_calibration_date": str(t["last_calibration_date"]) if t.get("last_calibration_date") else "",
@@ -844,7 +858,7 @@ Total records: {len(records)}
 
 Records:
 """ + "\n".join([
-        f"- {r['number']} ({r['type']}, {r['manufacturer']}): Cal {r['last_calibration_date']}, Due {r['next_due_date']}, Status: {r['calibration_status']}, Result: {r['result']}"
+        f"- {r['asset_tag']} ({r['tool_type']}, {r['manufacturer']}): {r['tool_name']} | Cal {r['last_calibration_date']}, Due {r['next_due_date']}, Status: {r['calibration_status']}"
         for r in records
     ])
 
@@ -878,21 +892,24 @@ async def list_equipment(
     company_id = auth["company_id"]
 
     tools = sb_get("tools", {
-        "select": "id,number,type,description,manufacturer,model,serial_number,location,building,frequency,ownership,calibration_status,tool_status,last_calibration_date,next_due_date",
+        "select": "id,asset_tag,tool_name,tool_type,calibration_method,manufacturer,model,serial_number,location,building,cal_interval_days,notes,calibration_status,active,last_calibration_date,next_due_date",
         "company_id": f"eq.{company_id}",
-        "order": "type,number",
+        "order": "tool_type,asset_tag",
     })
 
     return {
         "equipment": [
             {
-                "id": t["id"], "number": t["number"], "type": t.get("type", ""),
-                "description": t.get("description", ""), "manufacturer": t.get("manufacturer", ""),
+                "id": t["id"], "asset_tag": t.get("asset_tag", ""),
+                "tool_name": t.get("tool_name", ""), "tool_type": t.get("tool_type", ""),
+                "calibration_method": t.get("calibration_method", ""),
+                "manufacturer": t.get("manufacturer", ""),
                 "model": t.get("model", ""), "serial_number": t.get("serial_number", ""),
                 "location": t.get("location", ""), "building": t.get("building", ""),
-                "frequency": t.get("frequency", ""), "ownership": t.get("ownership", ""),
+                "cal_interval_days": t.get("cal_interval_days"),
+                "notes": t.get("notes", ""),
                 "calibration_status": t.get("calibration_status", ""),
-                "tool_status": t.get("tool_status", ""),
+                "active": t.get("active", True),
                 "last_cal_date": str(t["last_calibration_date"]) if t.get("last_calibration_date") else None,
                 "next_due_date": str(t["next_due_date"]) if t.get("next_due_date") else None,
             }
@@ -910,19 +927,21 @@ async def add_equipment(
 
     sb_post("tools", {
         "company_id": company_id,
-        "number": eq.number,
-        "type": eq.type,
-        "description": eq.description,
+        "asset_tag": eq.asset_tag,
+        "tool_name": eq.tool_name,
+        "tool_type": eq.tool_type,
+        "calibration_method": eq.calibration_method,
         "manufacturer": eq.manufacturer,
         "model": eq.model,
         "serial_number": eq.serial_number,
         "location": eq.location,
         "building": eq.building,
-        "frequency": eq.frequency,
-        "ownership": eq.ownership,
+        "cal_interval_days": eq.cal_interval_days,
+        "notes": eq.notes,
+        "active": True,
     })
 
-    return {"status": "success", "message": f"Tool {eq.number} added."}
+    return {"status": "success", "message": f"Tool {eq.asset_tag} added."}
 
 # ============================================================
 # DASHBOARD DATA
@@ -936,7 +955,7 @@ async def dashboard(
 
     # Get all tools for this company
     all_tools = sb_get("tools", {
-        "select": "id,number,type,manufacturer,calibration_status,next_due_date",
+        "select": "id,asset_tag,tool_name,tool_type,manufacturer,calibration_status,next_due_date",
         "company_id": f"eq.{company_id}",
         "order": "next_due_date.asc.nullslast",
     })
@@ -985,12 +1004,14 @@ async def dashboard(
         "calibration_count": cal_count,
         "status_summary": status_counts,
         "upcoming_expirations": [
-            {"number": t["number"], "type": t.get("type", ""), "manufacturer": t.get("manufacturer", ""),
+            {"asset_tag": t.get("asset_tag", ""), "tool_type": t.get("tool_type", ""), "tool_name": t.get("tool_name", ""),
+             "manufacturer": t.get("manufacturer", ""),
              "next_due_date": str(t["next_due_date"]), "status": t.get("calibration_status", "")}
             for t in upcoming
         ],
         "overdue": [
-            {"number": t["number"], "type": t.get("type", ""), "manufacturer": t.get("manufacturer", ""),
+            {"asset_tag": t.get("asset_tag", ""), "tool_type": t.get("tool_type", ""), "tool_name": t.get("tool_name", ""),
+             "manufacturer": t.get("manufacturer", ""),
              "next_due_date": str(t["next_due_date"]) if t.get("next_due_date") else None,
              "status": t.get("calibration_status", "")}
             for t in overdue_list
@@ -1006,7 +1027,7 @@ async def health():
     return {
         "status": "healthy",
         "product": "cal.gp3.app",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -1078,7 +1099,7 @@ async def check_proactive(
     company_id = auth["company_id"]
 
     overdue_tools = sb_get("tools", {
-        "select": "number,type,next_due_date",
+        "select": "asset_tag,tool_type,tool_name,next_due_date",
         "company_id": f"eq.{company_id}",
         "calibration_status": "eq.overdue",
         "order": "next_due_date.asc",
@@ -1088,7 +1109,7 @@ async def check_proactive(
 
     alerts_sent = 0
     if overdue:
-        tool_list = ", ".join([f"{r['number']} ({r.get('type','')})" for r in overdue[:3]])
+        tool_list = ", ".join([f"{r.get('asset_tag','')} ({r.get('tool_type','')})" for r in overdue[:3]])
         message = (
             f"Hey, I need your attention. We have {len(overdue)} overdue calibrations. "
             f"The most urgent ones are: {tool_list}. "

@@ -157,7 +157,7 @@ function Dashboard({ data }) {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text-muted)' }}>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Tool #</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Asset Tag</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Type</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Manufacturer</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Due Date</th>
@@ -166,8 +166,8 @@ function Dashboard({ data }) {
             <tbody>
               {data.overdue.map((item, i) => (
                 <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{item.number}</td>
-                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.type}</td>
+                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{item.asset_tag}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.tool_type}</td>
                   <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.manufacturer}</td>
                   <td style={{ padding: '10px 0', color: 'var(--danger)' }}>{item.next_due_date || 'Not set'}</td>
                 </tr>
@@ -183,7 +183,7 @@ function Dashboard({ data }) {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text-muted)' }}>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Tool #</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Asset Tag</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Type</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Manufacturer</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Due Date</th>
@@ -193,8 +193,8 @@ function Dashboard({ data }) {
             <tbody>
               {data.upcoming_expirations.map((item, i) => (
                 <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{item.number}</td>
-                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.type}</td>
+                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{item.asset_tag}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.tool_type}</td>
                   <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{item.manufacturer}</td>
                   <td style={{ padding: '10px 0' }}>{item.next_due_date}</td>
                   <td style={{ padding: '10px 0' }}>
@@ -433,8 +433,8 @@ function EquipmentPage({ token }) {
   const [equipment, setEquipment] = useState([])
   const [showAdd, setShowAdd] = useState(false)
   const [form, setForm] = useState({
-    number: '', type: '', description: '', manufacturer: '', model: '',
-    serial_number: '', location: '', building: '', frequency: 'annual', ownership: '',
+    asset_tag: '', tool_name: '', tool_type: '', calibration_method: '', manufacturer: '', model: '',
+    serial_number: '', location: '', building: '', cal_interval_days: 365, notes: '',
   })
 
   useEffect(() => { loadEquipment() }, [])
@@ -468,21 +468,21 @@ function EquipmentPage({ token }) {
 
       {showAdd && (
         <form onSubmit={handleAdd} className="card" style={{ marginBottom: 20, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-          <input placeholder="Tool Number *" value={form.number} onChange={e => setForm({ ...form, number: e.target.value })} required />
-          <input placeholder="Type (e.g., caliper, gauge)" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} />
+          <input placeholder="Asset Tag *" value={form.asset_tag} onChange={e => setForm({ ...form, asset_tag: e.target.value })} required />
+          <input placeholder="Equipment Type (e.g., Caliper, Snap Gage)" value={form.tool_type} onChange={e => setForm({ ...form, tool_type: e.target.value })} />
           <input placeholder="Manufacturer" value={form.manufacturer} onChange={e => setForm({ ...form, manufacturer: e.target.value })} />
           <input placeholder="Model" value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} />
           <input placeholder="Serial Number" value={form.serial_number} onChange={e => setForm({ ...form, serial_number: e.target.value })} />
           <input placeholder="Location" value={form.location} onChange={e => setForm({ ...form, location: e.target.value })} />
           <input placeholder="Building" value={form.building} onChange={e => setForm({ ...form, building: e.target.value })} />
-          <select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })}>
-            <option value="annual">Annual</option>
-            <option value="semi-annual">Semi-Annual</option>
-            <option value="quarterly">Quarterly</option>
-            <option value="monthly">Monthly</option>
-            <option value="as-needed">As Needed</option>
+          <select value={form.cal_interval_days} onChange={e => setForm({ ...form, cal_interval_days: parseInt(e.target.value) })}>
+            <option value={365}>Annual (365d)</option>
+            <option value={182}>Semi-Annual (182d)</option>
+            <option value={90}>Quarterly (90d)</option>
+            <option value={30}>Monthly (30d)</option>
+            <option value={730}>Biennial (730d)</option>
           </select>
-          <input placeholder="Description" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} style={{ gridColumn: '1 / -1' }} />
+          <input placeholder="Tool Name / Description" value={form.tool_name} onChange={e => setForm({ ...form, tool_name: e.target.value })} style={{ gridColumn: '1 / -1' }} />
           <button type="submit" style={{ gridColumn: '1 / -1' }}>Save Tool</button>
         </form>
       )}
@@ -493,12 +493,12 @@ function EquipmentPage({ token }) {
           <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 700 }}>
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border)', fontSize: 12, color: 'var(--text-muted)' }}>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Tool #</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Asset Tag</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Type</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Manufacturer</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Model</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Location</th>
-                <th style={{ textAlign: 'left', padding: '8px 0' }}>Frequency</th>
+                <th style={{ textAlign: 'left', padding: '8px 0' }}>Interval</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Last Cal</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Due</th>
                 <th style={{ textAlign: 'left', padding: '8px 0' }}>Status</th>
@@ -507,12 +507,12 @@ function EquipmentPage({ token }) {
             <tbody>
               {equipment.map((eq) => (
                 <tr key={eq.id} style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{eq.number}</td>
-                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.type}</td>
+                  <td style={{ padding: '10px 0', fontWeight: 600 }}>{eq.asset_tag}</td>
+                  <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.tool_type}</td>
                   <td style={{ padding: '10px 0' }}>{eq.manufacturer}</td>
                   <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.model}</td>
                   <td style={{ padding: '10px 0', color: 'var(--text-muted)' }}>{eq.location}</td>
-                  <td style={{ padding: '10px 0' }}>{eq.frequency}</td>
+                  <td style={{ padding: '10px 0' }}>{eq.cal_interval_days ? `${eq.cal_interval_days}d` : '-'}</td>
                   <td style={{ padding: '10px 0' }}>{eq.last_cal_date || '-'}</td>
                   <td style={{ padding: '10px 0' }}>{eq.next_due_date || '-'}</td>
                   <td style={{ padding: '10px 0' }}>
