@@ -639,7 +639,7 @@ function DownloadPage({ token }) {
 // ============================================================
 // EQUIPMENT
 // ============================================================
-function EquipmentPage({ token }) {
+function EquipmentPage({ token, onImport }) {
   const [equipment, setEquipment] = useState([])
   const [showAdd, setShowAdd] = useState(false)
   const [form, setForm] = useState({
@@ -673,7 +673,12 @@ function EquipmentPage({ token }) {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
         <h2 style={{ fontSize: 20 }}>Equipment Registry ({equipment.length})</h2>
-        <button onClick={() => setShowAdd(!showAdd)}>{showAdd ? 'Cancel' : '+ Add Tool'}</button>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button className="btn-secondary" onClick={onImport} style={{ fontSize: 13 }}>
+            &#8645; Import from CSV
+          </button>
+          <button onClick={() => setShowAdd(!showAdd)}>{showAdd ? 'Cancel' : '+ Add Tool'}</button>
+        </div>
       </div>
 
       {showAdd && (
@@ -743,6 +748,151 @@ function EquipmentPage({ token }) {
 }
 
 // ============================================================
+// IMPORT PAGE
+// ============================================================
+function ImportPage({ token }) {
+  const [dragOver, setDragOver] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState('')
+  const fileRef = useRef()
+
+  const downloadTemplate = async () => {
+    try {
+      const res = await api(token).get('/cal/import/template', { responseType: 'blob' })
+      const url = window.URL.createObjectURL(new Blob([res.data], { type: 'text/csv' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'cal_import_template.csv'
+      a.click()
+      window.URL.revokeObjectURL(url)
+    } catch {
+      setError('Failed to download template.')
+    }
+  }
+
+  const handleFile = async (file) => {
+    if (!file) return
+    if (!file.name.endsWith('.csv')) {
+      setError('Only CSV files are accepted.')
+      return
+    }
+    setLoading(true)
+    setResult(null)
+    setError('')
+    const form = new FormData()
+    form.append('file', file)
+    try {
+      const res = await api(token).post('/cal/import', form)
+      setResult(res.data)
+    } catch (err) {
+      setError(err.response?.data?.detail || 'Import failed.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleDrop = (e) => {
+    e.preventDefault()
+    setDragOver(false)
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0])
+  }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <h2 style={{ fontSize: 20 }}>Import Equipment (CSV)</h2>
+        <button className="btn-secondary" onClick={downloadTemplate} style={{ fontSize: 13 }}>
+          &#8595; Download Template
+        </button>
+      </div>
+
+      <div className="card" style={{ marginBottom: 16, fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.7 }}>
+        <strong>Required column:</strong> <code>asset_tag</code><br />
+        <strong>Optional columns:</strong> tool_name, tool_type, manufacturer, model, serial_number,
+        location, building, cal_interval_days, last_calibration_date, next_due_date, calibration_status<br />
+        Existing tools with matching asset_tag are skipped. Download the template above for correct column headers.
+      </div>
+
+      <div
+        className="card"
+        onClick={() => fileRef.current?.click()}
+        onDrop={handleDrop}
+        onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+        onDragLeave={() => setDragOver(false)}
+        style={{
+          textAlign: 'center', padding: 60, cursor: 'pointer',
+          borderStyle: 'dashed',
+          borderColor: dragOver ? 'var(--accent)' : 'var(--border)',
+          background: dragOver ? 'rgba(79,140,255,0.05)' : 'var(--surface)',
+          marginBottom: 16,
+        }}
+      >
+        <div style={{ fontSize: 36, marginBottom: 12 }}>&#128196;</div>
+        <div style={{ fontSize: 15, fontWeight: 600 }}>Drop CSV file here or click to browse</div>
+        <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 6 }}>CSV files only</div>
+        <input ref={fileRef} type="file" accept=".csv" onChange={e => handleFile(e.target.files[0])} style={{ display: 'none' }} />
+      </div>
+
+      {loading && (
+        <div className="card" style={{ textAlign: 'center', color: 'var(--accent)' }}>
+          Importing tools...
+        </div>
+      )}
+
+      {error && (
+        <div className="card" style={{ borderLeft: '3px solid var(--danger)', color: 'var(--danger)', fontSize: 14 }}>
+          {error}
+        </div>
+      )}
+
+      {result && (
+        <div className="card" style={{ borderLeft: `3px solid ${result.errors?.length ? 'var(--warning)' : 'var(--success)'}` }}>
+          <div style={{ display: 'flex', gap: 32, marginBottom: result.errors?.length ? 20 : 0 }}>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--success)' }}>{result.imported}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Imported</div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--text-muted)' }}>{result.skipped}</div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Skipped</div>
+            </div>
+            {result.errors?.length > 0 && (
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: 'var(--warning)' }}>{result.errors.length}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Errors</div>
+              </div>
+            )}
+          </div>
+
+          {result.errors?.length > 0 && (
+            <>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Row Errors</div>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' }}>
+                    <th style={{ textAlign: 'left', padding: '6px 0', width: 60 }}>Row</th>
+                    <th style={{ textAlign: 'left', padding: '6px 0' }}>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.errors.map((err, i) => (
+                    <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '8px 0', color: 'var(--text-muted)' }}>{err.row}</td>
+                      <td style={{ padding: '8px 0', color: 'var(--warning)' }}>{err.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ============================================================
 // APP SHELL
 // ============================================================
 const NAV = [
@@ -751,6 +901,7 @@ const NAV = [
   { id: 'question', label: 'Ask Agent', icon: '&#9998;' },
   { id: 'download', label: 'Evidence', icon: '&#8595;' },
   { id: 'equipment', label: 'Equipment', icon: '&#9881;' },
+  { id: 'import', label: 'Import', icon: '&#8645;' },
 ]
 
 export default function App() {
@@ -865,7 +1016,8 @@ export default function App() {
         {page === 'upload' && <UploadPage token={token} />}
         {page === 'question' && <QuestionPage token={token} />}
         {page === 'download' && <DownloadPage token={token} />}
-        {page === 'equipment' && <EquipmentPage token={token} />}
+        {page === 'equipment' && <EquipmentPage token={token} onImport={() => setPage('import')} />}
+        {page === 'import' && <ImportPage token={token} />}
       </div>
     </div>
   )

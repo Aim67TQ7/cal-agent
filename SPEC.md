@@ -179,11 +179,11 @@
 | **Total COGS** | **~$1** |
 
 ### Revenue
-- Platform fee: **$700/month** per tenant
+- Platform fee: **$350/month** (Founder) / **$1,750/month** (Pro) per tenant
 - Gross margin: **99%**
 
 ### Breakeven
-- 4 customers = $2,800/month revenue vs ~$4 COGS (co-located)
+- 1 Pro customer = $1,750/month revenue vs ~$1 COGS (co-located)
 
 ---
 

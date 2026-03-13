@@ -623,17 +623,17 @@ Automated via Caddy + Let's Encrypt. Certificate issued on first request, auto-r
 | VPS allocation | $0 (co-located) |
 | Anthropic API tokens | $0.50-1.00 |
 | **Total COGS** | **~$1** |
-| **Revenue** | **$700** |
-| **Gross margin** | **99.8%** |
+| **Revenue** | **$350 (Founder) / $1,750 (Pro)** |
+| **Gross margin** | **99.7%+** |
 
 ### Scaling Thresholds
 
-| Tenants | Monthly Revenue | Monthly COGS | Action Needed |
-|---------|----------------|-------------|---------------|
-| 1-10 | $700-7,000 | $1-10 | Current VPS sufficient |
-| 10-25 | $7,000-17,500 | $10-25 | Monitor RAM, may need dedicated VPS |
-| 25-50 | $17,500-35,000 | $25-50 | Dedicated VPS ($48/mo), connection pooling |
-| 50+ | $35,000+ | $50+ | Kubernetes, read replicas, CDN |
+| Tenants | Monthly Revenue (blended) | Monthly COGS | Action Needed |
+|---------|--------------------------|-------------|---------------|
+| 1-10 | $350-7,000 | $1-10 | Current VPS sufficient |
+| 10-25 | $7,000-25,000 | $10-25 | Monitor RAM, may need dedicated VPS |
+| 25-50 | $25,000-60,000 | $25-50 | Dedicated VPS ($48/mo), connection pooling |
+| 50+ | $60,000+ | $50+ | Kubernetes, read replicas, CDN |
 
 ---
 

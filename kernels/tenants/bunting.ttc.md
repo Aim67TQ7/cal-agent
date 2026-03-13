@@ -215,6 +215,54 @@ email_log({{limit|10}}):
   FROM cal.email_log WHERE company_id = :cid
   ORDER BY received_at DESC LIMIT {{limit}}
 
+interval_variance():
+  WITH intervals AS (
+    SELECT t.tool_type, t.cal_interval_days as planned_days,
+      c.calibration_date,
+      LAG(c.calibration_date) OVER (PARTITION BY t.id ORDER BY c.calibration_date) as prev_date
+    FROM cal.calibrations c
+    JOIN cal.tools t ON c.tool_id = t.id
+    WHERE t.company_id = :cid AND t.active = true
+  )
+  SELECT tool_type, planned_days,
+    AVG(calibration_date::date - prev_date::date)::int as avg_actual_days,
+    COUNT(*) as sample_size
+  FROM intervals WHERE prev_date IS NOT NULL
+  GROUP BY tool_type, planned_days
+  ORDER BY avg_actual_days DESC
+  -- actual > planned * 1.2 = under-calibrating (compliance risk)
+  -- actual < planned * 0.8 = over-calibrating (cost waste)
+
+vendor_turnaround():
+  SELECT c.performed_by as vendor,
+    ROUND(AVG(c.received_from_vendor_date - c.sent_to_vendor_date)) as avg_days,
+    v.sla_days,
+    COUNT(*) as sample_size,
+    CASE WHEN AVG(c.received_from_vendor_date - c.sent_to_vendor_date) > v.sla_days
+      THEN 'SLA EXCEEDED' ELSE 'On Track' END as sla_status
+  FROM cal.calibrations c
+  JOIN cal.tools t ON c.tool_id = t.id
+  LEFT JOIN cal.vendors v ON v.company_id = :cid
+    AND v.vendor_name ILIKE ('%' || c.performed_by || '%')
+  WHERE t.company_id = :cid
+    AND c.sent_to_vendor_date IS NOT NULL
+    AND c.received_from_vendor_date IS NOT NULL
+  GROUP BY c.performed_by, v.sla_days
+  ORDER BY avg_days DESC
+
+failure_rate_by_type():
+  SELECT t.tool_type,
+    COUNT(*) as total_calibrations,
+    SUM(CASE WHEN c.result IN ('fail', 'out_of_tolerance') THEN 1 ELSE 0 END) as failures,
+    ROUND(100.0 * SUM(CASE WHEN c.result IN ('fail', 'out_of_tolerance') THEN 1 ELSE 0 END) / COUNT(*), 1) as failure_pct
+  FROM cal.calibrations c
+  JOIN cal.tools t ON c.tool_id = t.id
+  WHERE t.company_id = :cid AND c.result IS NOT NULL
+  GROUP BY t.tool_type
+  HAVING COUNT(*) >= 3
+  ORDER BY failure_pct DESC
+  -- tool_types where failure_pct > 10 → review procedure or reduce interval
+
 </QUERY_TEMPLATES>
 ```
 

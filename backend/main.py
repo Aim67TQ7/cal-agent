@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, text
@@ -162,6 +162,12 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+def require_admin(auth: dict = Depends(verify_token)):
+    """Dependency: require admin role. Apply to write-mutating endpoints."""
+    if auth.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return auth
+
 # ============================================================
 # KERNEL LOADER
 # ============================================================
@@ -246,7 +252,7 @@ def load_tenant_branding(company_id: int) -> dict:
 
     content = tenant_kernel_path.read_text()
 
-    brand_match = re.search(r'### 品牌标识.*?```(.*?)```', content, re.DOTALL)
+    brand_match = re.search(r'### 品牌[标標][识識].*?```(.*?)```', content, re.DOTALL)
     if not brand_match:
         return branding
 
@@ -579,14 +585,32 @@ async def upload_cert(
 ):
     company_id = auth["company_id"]
 
-    # Save file
-    upload_dir = Path(f"/app/uploads/{company_id}")
-    upload_dir.mkdir(parents=True, exist_ok=True)
     file_id = str(uuid.uuid4())
-    file_path = upload_dir / f"{file_id}_{file.filename}"
-
     content = await file.read()
-    file_path.write_bytes(content)
+
+    # Upload to Supabase Storage (tenant-files bucket, cal/ prefix)
+    # Path: cal/{company_id}/{uuid}_{filename}
+    storage_path = f"cal/{company_id}/{file_id}_{file.filename}"
+    try:
+        r = httpx.post(
+            f"{SUPABASE_URL}/storage/v1/object/tenant-files/{storage_path}",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": file.content_type or "application/octet-stream",
+                "x-upsert": "true",
+            },
+            content=content,
+            timeout=30,
+        )
+        r.raise_for_status()
+        logger.info(f"[UPLOAD] Stored cert to Supabase Storage: {storage_path}")
+    except Exception as e:
+        logger.warning(f"[UPLOAD] Supabase Storage failed ({e}), falling back to local disk")
+        upload_dir = Path(f"/app/uploads/{company_id}")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        (upload_dir / f"{file_id}_{file.filename}").write_bytes(content)
+        storage_path = f"local/{company_id}/{file_id}_{file.filename}"
 
     # Load kernel and extract data
     kernel = load_tenant_kernel(None, company_id)
@@ -600,9 +624,10 @@ Return ONLY a valid JSON object:
     "calibration_date": "YYYY-MM-DD",
     "next_due_date": "YYYY-MM-DD",
     "technician": "string - technician name if available, else empty",
-    "result": "pass or fail",
+    "result": "pass | fail | adjusted | out_of_tolerance | conditional",
     "comments": "string - any relevant notes"
-}}"""
+}}
+result values: pass=within spec, adjusted=corrected during visit (usable), out_of_tolerance=out of spec not corrected, fail=failed unknown cause, conditional=needs human review"""
 
     agent_response = call_agent(kernel, prompt)
 
@@ -644,11 +669,11 @@ Return ONLY a valid JSON object:
         "notes": data.get("comments", ""),
     })
 
-    # Insert attachment record via REST
+    # Insert attachment record via REST — filename stores Supabase Storage path
     sb_post("attachments", {
         "tool_id": tool_id,
         "calibration_id": cal_record.get("id"),
-        "filename": f"{file_id}_{file.filename}",
+        "filename": storage_path,
         "original_name": file.filename,
         "file_size": len(content),
         "mime_type": file.content_type or "application/octet-stream",
@@ -1008,7 +1033,7 @@ async def list_equipment(
 @app.post("/cal/equipment")
 async def add_equipment(
     eq: EquipmentCreate,
-    auth: dict = Depends(verify_token),
+    auth: dict = Depends(require_admin),
 ):
     company_id = auth["company_id"]
 
@@ -1030,6 +1055,74 @@ async def add_equipment(
     })
 
     return {"status": "success", "message": f"Tool {eq.asset_tag} added."}
+
+@app.get("/cal/import/template")
+async def import_template(auth: dict = Depends(verify_token)):
+    """Download a CSV template with the correct column headers for bulk tool import."""
+    from fastapi.responses import Response
+    header = "asset_tag,tool_name,tool_type,manufacturer,model,serial_number,location,building,cal_interval_days,last_calibration_date,next_due_date,calibration_status\n"
+    example = "BM-0001,Outside Micrometer 0-1,Micrometer,Mitutoyo,293-340-30,12345678,Inspection,Building A,365,2024-06-01,2025-06-01,current\n"
+    return Response(content=header + example, media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=cal_import_template.csv"})
+
+@app.post("/cal/import")
+async def import_tools(
+    file: UploadFile = File(...),
+    auth: dict = Depends(require_admin),
+):
+    """Bulk import tools from CSV. Required column: asset_tag. Skips duplicates."""
+    import csv
+    company_id = auth["company_id"]
+    content = (await file.read()).decode("utf-8", errors="replace")
+    reader = csv.DictReader(content.splitlines())
+    imported, skipped, errors = 0, 0, []
+
+    for i, row in enumerate(reader, 1):
+        asset_tag = (row.get("asset_tag") or row.get("number") or row.get("tool_id") or "").strip()
+        if not asset_tag:
+            errors.append({"row": i, "reason": "missing asset_tag"}); skipped += 1; continue
+
+        existing = sb_get("tools", {"select": "id", "company_id": f"eq.{company_id}", "asset_tag": f"eq.{asset_tag}"})
+        if existing:
+            skipped += 1; continue
+
+        def _clean(val: str, default="") -> str:
+            return (val or "").strip() or default
+
+        def _int_or_none(val: str):
+            try:
+                return int(val.strip()) if val and val.strip() else None
+            except ValueError:
+                return None
+
+        try:
+            sb_post("tools", {
+                "company_id": company_id,
+                "asset_tag": asset_tag,
+                "tool_name": _clean(row.get("tool_name") or row.get("description")),
+                "tool_type": _clean(row.get("tool_type") or row.get("type")),
+                "manufacturer": _clean(row.get("manufacturer")),
+                "model": _clean(row.get("model")),
+                "serial_number": _clean(row.get("serial_number")),
+                "location": _clean(row.get("location")),
+                "building": _clean(row.get("building")),
+                "cal_interval_days": _int_or_none(row.get("cal_interval_days")),
+                "last_calibration_date": _clean(row.get("last_calibration_date")) or None,
+                "next_due_date": _clean(row.get("next_due_date")) or None,
+                "calibration_status": _clean(row.get("calibration_status"), "current"),
+                "active": True,
+            })
+            imported += 1
+        except Exception as e:
+            errors.append({"row": i, "asset_tag": asset_tag, "reason": str(e)[:200]})
+            skipped += 1
+
+    return {
+        "status": "done",
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors[:50],  # cap error list
+    }
 
 # ============================================================
 # DASHBOARD DATA
@@ -1115,7 +1208,7 @@ async def health():
     return {
         "status": "healthy",
         "product": "cal.gp3.app",
-        "version": "2.5.0",
+        "version": app.version,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -1126,12 +1219,93 @@ async def health():
 MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "gp3.app")
 CAL_SERVICE_KEY = os.getenv("SECRET_KEY", "")  # reuse SECRET_KEY for cron auth
+EMAIL_ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("EMAIL_ALLOWED_DOMAINS", "gp3.app").split(",") if d.strip()]
+EMAIL_DRY_RUN = os.getenv("EMAIL_DRY_RUN", "false").lower() == "true"
+
+def _validate_email_domains(addresses: str, allowed_domains: list[str]) -> tuple[bool, list[str]]:
+    """Validate all email addresses are within allowed domains.
+    Returns (all_valid, list_of_rejected_addresses)."""
+    if not addresses or not addresses.strip():
+        return True, []
+    rejected = []
+    for addr in addresses.split(","):
+        addr = addr.strip()
+        match = re.search(r'[\w.+-]+@[\w.-]+', addr)
+        if not match:
+            continue
+        email = match.group(0).lower()
+        domain = email.split("@", 1)[1]
+        if not any(domain == d or domain.endswith("." + d) for d in allowed_domains):
+            rejected.append(email)
+    return len(rejected) == 0, rejected
+
+def _build_email_signature(company_id: int) -> str:
+    """Build branded HTML email signature with AI agent disclaimer."""
+    branding = load_tenant_branding(company_id)
+    co_name = branding.get("company_name", "Calibration Agent")
+    primary = branding.get("primary_color", "#003366")
+    accent = branding.get("accent_color", "#CC0000")
+    font = branding.get("font", "Helvetica")
+    phone = branding.get("phone", "")
+    web = branding.get("web", "")
+    address_lines = branding.get("address_lines", [])
+
+    address_html = "<br>".join(address_lines) if address_lines else ""
+    phone_html = f'<br>Phone: <a href="tel:{phone}" style="color:{primary};text-decoration:none;">{phone}</a>' if phone else ""
+    web_html = f'<br><a href="https://{web}" style="color:{primary};text-decoration:none;">{web}</a>' if web else ""
+
+    return f"""
+<div style="margin-top:32px;padding-top:16px;border-top:2px solid {primary};font-family:{font},Arial,sans-serif;">
+  <table cellpadding="0" cellspacing="0" border="0" style="font-size:13px;color:#333;">
+    <tr>
+      <td style="padding-right:16px;border-right:3px solid {accent};">
+        <strong style="font-size:15px;color:{primary};">Cal</strong>
+        <br><span style="font-size:11px;color:#666;">AI Calibration Agent</span>
+      </td>
+      <td style="padding-left:16px;">
+        <strong style="color:{primary};">{co_name}</strong>
+        <br><span style="font-size:12px;color:#555;">{address_html}</span>
+        {phone_html}
+        {web_html}
+      </td>
+    </tr>
+  </table>
+  <p style="font-size:10px;color:#999;margin-top:12px;line-height:1.4;">
+    This message was generated by Cal, an AI-powered calibration management agent
+    operated by {co_name} Quality Department.
+    For questions or corrections, contact your Quality Manager directly.
+  </p>
+  <p style="font-size:9px;color:#b0b0b0;margin-top:8px;line-height:1.3;font-style:italic;">
+    Cal is currently in supervised evaluation. Information provided is generated from
+    calibration records and should be independently verified against your quality
+    management system prior to taking action. {co_name} Quality Department maintains
+    full authority over all calibration decisions and compliance determinations.
+  </p>
+</div>
+"""
 
 def _send_mailgun(sender: str, to: str, subject: str, body: str, cc: str = "") -> bool:
     """Send email via Mailgun. Returns True on success."""
     if not MAILGUN_API_KEY:
         logger.warning("MAILGUN_API_KEY not set — skipping email")
         return False
+
+    # --- DOMAIN SAFETY GUARD ---
+    to_ok, to_rejected = _validate_email_domains(to, EMAIL_ALLOWED_DOMAINS)
+    if not to_ok:
+        logger.error(f"[EMAIL BLOCKED] TO addresses outside allowed domains: {to_rejected}. Allowed: {EMAIL_ALLOWED_DOMAINS}")
+        return False
+    if cc:
+        cc_ok, cc_rejected = _validate_email_domains(cc, EMAIL_ALLOWED_DOMAINS)
+        if not cc_ok:
+            logger.error(f"[EMAIL BLOCKED] CC addresses outside allowed domains: {cc_rejected}. Allowed: {EMAIL_ALLOWED_DOMAINS}")
+            return False
+
+    # --- DRY RUN ---
+    if EMAIL_DRY_RUN:
+        logger.info(f"[EMAIL DRY-RUN] Would send to={to} cc={cc} subject={subject}")
+        return True
+
     data = {"from": sender, "to": to, "subject": subject, "html": body}
     if cc:
         data["cc"] = cc
@@ -1161,6 +1335,320 @@ def _log_email(company_id: int, sender: str, to: str, subject: str, body: str, s
         })
     except Exception:
         pass
+
+def _get_company_settings(company_id: int) -> dict:
+    """Load all cal.settings rows for a company into a flat dict."""
+    try:
+        rows = sb_get("settings", {"select": "key,value", "company_id": f"eq.{company_id}"})
+        return {r["key"]: r["value"] for r in rows}
+    except Exception as e:
+        logger.warning(f"[SETTINGS] Failed to load settings for company {company_id}: {e}")
+        return {}
+
+def _process_cert_attachment(company_id: int, filename: str, content: bytes, mime_type: str, email_log_id=None) -> dict:
+    """Extract calibration data from cert bytes, create cal record + attachment. Returns status dict.
+    Shared by /cal/upload and /api/email/ingest."""
+    kernel = load_tenant_kernel(None, company_id)
+    prompt = f"""Extract calibration data from this calibration certificate.
+Filename: {filename}
+File size: {len(content)} bytes
+
+Return ONLY a valid JSON object:
+{{
+    "tool_number": "string - the tool/instrument number or ID",
+    "calibration_date": "YYYY-MM-DD",
+    "next_due_date": "YYYY-MM-DD",
+    "technician": "string - technician name if available, else empty",
+    "result": "pass | fail | adjusted | out_of_tolerance | conditional",
+    "comments": "string - any relevant notes"
+}}
+result: pass=within spec, adjusted=corrected during visit, out_of_tolerance=not corrected, fail=failed unknown cause, conditional=needs human review"""
+
+    try:
+        agent_response = call_agent(kernel, prompt)
+        text = agent_response["text"]
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            start, end = text.find("{"), text.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(text[start:end])
+            else:
+                return {"status": "error", "message": "Could not parse certificate data."}
+    except Exception as e:
+        return {"status": "error", "message": f"Extraction failed: {e}"}
+
+    tools = sb_get("tools", {
+        "select": "id",
+        "company_id": f"eq.{company_id}",
+        "asset_tag": f"eq.{data.get('tool_number', '')}",
+    })
+    if not tools:
+        return {
+            "status": "unmatched",
+            "message": f"Tool '{data.get('tool_number')}' not found in registry. Add it first.",
+            "extracted_data": data,
+        }
+
+    tool_id = tools[0]["id"]
+    file_id = str(uuid.uuid4())
+    storage_path = f"cal/{company_id}/{file_id}_{filename}"
+    try:
+        httpx.post(
+            f"{SUPABASE_URL}/storage/v1/object/tenant-files/{storage_path}",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": mime_type or "application/octet-stream", "x-upsert": "true"},
+            content=content, timeout=30,
+        ).raise_for_status()
+    except Exception as e:
+        logger.warning(f"[CERT] Storage upload failed: {e}")
+        storage_path = f"local/{company_id}/{file_id}_{filename}"
+
+    cal_record = sb_post("calibrations", {
+        "cert_number": f"CAL-{datetime.utcnow().strftime('%Y%m%d')}-{tool_id}",
+        "tool_id": tool_id,
+        "calibration_date": data.get("calibration_date"),
+        "result": data.get("result", "conditional"),
+        "next_calibration_date": data.get("next_due_date"),
+        "performed_by": data.get("technician", ""),
+        "notes": data.get("comments", ""),
+    })
+    sb_post("attachments", {
+        "tool_id": tool_id,
+        "calibration_id": cal_record.get("id"),
+        "filename": storage_path,
+        "original_name": filename,
+        "file_size": len(content),
+        "mime_type": mime_type or "application/octet-stream",
+    })
+    sb_patch("tools", {"id": f"eq.{tool_id}"}, {
+        "last_calibration_date": data.get("calibration_date"),
+        "next_due_date": data.get("next_due_date"),
+        "calibration_status": "current",
+    })
+    if email_log_id and cal_record.get("id"):
+        try:
+            sb_patch("email_log", {"id": f"eq.{email_log_id}"}, {
+                "calibration_id": cal_record["id"],
+                "tool_id": tool_id,
+                "processed_at": datetime.utcnow().isoformat(),
+            })
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "message": f"Cert for {data.get('tool_number')} processed. Next due {data.get('next_due_date', 'unknown')}.",
+        "data": data,
+        "tool_id": tool_id,
+        "calibration_id": cal_record.get("id"),
+    }
+
+# ============================================================
+# ANALYTICS FUNCTIONS (Fix 3, 4, 5, 9, 10)
+# ============================================================
+
+def failure_rate_by_type(company_id: int) -> list:
+    """Failure/OOT rate per tool_type. Flags types with >10% non-pass rate."""
+    try:
+        tools = sb_get("tools", {"select": "id,tool_type", "company_id": f"eq.{company_id}", "active": "eq.true"})
+        if not tools:
+            return []
+        tool_map = {t["id"]: t.get("tool_type", "Unknown") for t in tools}
+        tool_ids = ",".join(str(t["id"]) for t in tools)
+        cals = sb_get("calibrations", {"select": "tool_id,result", f"tool_id": f"in.({tool_ids})"})
+        by_type: dict = {}
+        for c in cals:
+            tt = tool_map.get(c["tool_id"], "Unknown")
+            by_type.setdefault(tt, {"total": 0, "failures": 0})
+            by_type[tt]["total"] += 1
+            if c.get("result") in ("fail", "out_of_tolerance"):
+                by_type[tt]["failures"] += 1
+        result = []
+        for tt, counts in by_type.items():
+            if counts["total"] < 3:
+                continue
+            pct = round(counts["failures"] * 100.0 / counts["total"], 1)
+            result.append({"tool_type": tt, "total": counts["total"],
+                           "failures": counts["failures"], "failure_pct": pct, "flagged": pct > 10})
+        return sorted(result, key=lambda x: -x["failure_pct"])
+    except Exception as e:
+        logger.warning(f"[ANALYTICS] failure_rate_by_type: {e}")
+        return []
+
+def interval_variance_report(company_id: int) -> list:
+    """Compare avg actual calibration interval vs planned (cal_interval_days) per tool_type."""
+    try:
+        tools = sb_get("tools", {
+            "select": "id,tool_type,cal_interval_days",
+            "company_id": f"eq.{company_id}", "active": "eq.true",
+        })
+        if not tools:
+            return []
+        tool_map = {t["id"]: t for t in tools}
+        tool_ids = ",".join(str(t["id"]) for t in tools)
+        cals = sb_get("calibrations", {
+            "select": "tool_id,calibration_date",
+            f"tool_id": f"in.({tool_ids})",
+            "order": "tool_id.asc,calibration_date.asc",
+        })
+        # Group by tool_id, compute consecutive diffs
+        by_tool: dict = {}
+        for c in cals:
+            tid = c["tool_id"]
+            if not c.get("calibration_date"):
+                continue
+            by_tool.setdefault(tid, []).append(c["calibration_date"][:10])
+        # Compute intervals per tool
+        type_intervals: dict = {}  # {tool_type: [actual_days, ...]}
+        for tid, dates in by_tool.items():
+            if len(dates) < 2:
+                continue
+            tool = tool_map.get(tid, {})
+            tt = tool.get("tool_type", "Unknown")
+            planned = tool.get("cal_interval_days")
+            if not planned:
+                continue
+            for i in range(1, len(dates)):
+                try:
+                    diff = (date.fromisoformat(dates[i]) - date.fromisoformat(dates[i-1])).days
+                    if diff > 0:
+                        type_intervals.setdefault(tt, {"diffs": [], "planned": planned})["diffs"].append(diff)
+                except Exception:
+                    pass
+        result = []
+        for tt, data in type_intervals.items():
+            if not data["diffs"]:
+                continue
+            avg_actual = round(sum(data["diffs"]) / len(data["diffs"]))
+            planned = data["planned"]
+            ratio = avg_actual / planned if planned else 1
+            flag = "over-calibrating (cost waste)" if ratio < 0.8 else \
+                   "under-calibrating (compliance risk)" if ratio > 1.2 else "on target"
+            result.append({
+                "tool_type": tt, "planned_days": planned, "avg_actual_days": avg_actual,
+                "ratio": round(ratio, 2), "sample_size": len(data["diffs"]), "flag": flag,
+            })
+        return sorted(result, key=lambda x: x["ratio"])
+    except Exception as e:
+        logger.warning(f"[ANALYTICS] interval_variance_report: {e}")
+        return []
+
+def vendor_turnaround_report(company_id: int) -> list:
+    """Avg turnaround days vs SLA per vendor. Flags SLA violations."""
+    try:
+        tools = sb_get("tools", {"select": "id", "company_id": f"eq.{company_id}", "active": "eq.true"})
+        if not tools:
+            return []
+        tool_ids = ",".join(str(t["id"]) for t in tools)
+        cals = sb_get("calibrations", {
+            "select": "performed_by,sent_to_vendor_date,received_from_vendor_date",
+            f"tool_id": f"in.({tool_ids})",
+            "not.sent_to_vendor_date.is": "null",
+            "not.received_from_vendor_date.is": "null",
+        })
+        vendors = sb_get("vendors", {"select": "vendor_name,sla_days", "company_id": f"eq.{company_id}"})
+        sla_map = {v["vendor_name"].lower(): v.get("sla_days", 14) for v in vendors}
+        by_vendor: dict = {}
+        for c in cals:
+            name = c.get("performed_by", "Unknown")
+            try:
+                days = (date.fromisoformat(str(c["received_from_vendor_date"])[:10]) -
+                        date.fromisoformat(str(c["sent_to_vendor_date"])[:10])).days
+                if days >= 0:
+                    by_vendor.setdefault(name, []).append(days)
+            except Exception:
+                pass
+        result = []
+        for name, days_list in by_vendor.items():
+            avg = round(sum(days_list) / len(days_list), 1)
+            sla = sla_map.get(name.lower(), 14)
+            result.append({"vendor": name, "avg_turnaround_days": avg, "sla_days": sla,
+                           "sample_size": len(days_list), "sla_exceeded": avg > sla})
+        return sorted(result, key=lambda x: -x["avg_turnaround_days"])
+    except Exception as e:
+        logger.warning(f"[ANALYTICS] vendor_turnaround_report: {e}")
+        return []
+
+def cost_projection(company_id: int, days: int = 90) -> dict:
+    """Estimate calibration costs for next {days} days using historical avg cost per type."""
+    try:
+        tools = sb_get("tools", {"select": "id,tool_type", "company_id": f"eq.{company_id}", "active": "eq.true"})
+        if not tools:
+            return {"total_estimated": 0, "by_type": [], "confidence": "low"}
+        tool_map = {t["id"]: t.get("tool_type", "Unknown") for t in tools}
+        tool_ids = ",".join(str(t["id"]) for t in tools)
+        # Historical cost by tool_type
+        all_cals = sb_get("calibrations", {"select": "tool_id,cost", f"tool_id": f"in.({tool_ids})"})
+        cost_by_type: dict = {}
+        for c in all_cals:
+            cost = c.get("cost")
+            if cost is None:
+                continue
+            tt = tool_map.get(c["tool_id"], "Unknown")
+            cost_by_type.setdefault(tt, []).append(float(cost))
+        # Upcoming tools
+        cutoff = (date.today() + timedelta(days=days)).isoformat()
+        upcoming = sb_get("tools", {
+            "select": "tool_type",
+            "company_id": f"eq.{company_id}", "active": "eq.true",
+            "next_due_date": f"lte.{cutoff}",
+            "next_due_date": f"gte.{date.today().isoformat()}",
+        })
+        upcoming_counts: dict = {}
+        for t in upcoming:
+            tt = t.get("tool_type", "Unknown")
+            upcoming_counts[tt] = upcoming_counts.get(tt, 0) + 1
+        total = 0.0
+        by_type = []
+        for tt, count in upcoming_counts.items():
+            costs = cost_by_type.get(tt, [])
+            avg_cost = round(sum(costs) / len(costs), 2) if costs else 0
+            estimated = round(avg_cost * count, 2)
+            confidence = "high" if len(costs) >= 5 else "medium" if len(costs) >= 2 else "low"
+            by_type.append({"tool_type": tt, "upcoming_count": count,
+                           "avg_historical_cost": avg_cost, "estimated": estimated, "confidence": confidence})
+            total += estimated
+        overall_confidence = "high" if all(b["confidence"] == "high" for b in by_type) else \
+                            "low" if all(b["confidence"] == "low" for b in by_type) else "medium"
+        return {"total_estimated": round(total, 2), "by_type": sorted(by_type, key=lambda x: -x["estimated"]),
+                "confidence": overall_confidence, "days_ahead": days}
+    except Exception as e:
+        logger.warning(f"[ANALYTICS] cost_projection: {e}")
+        return {"total_estimated": 0, "by_type": [], "confidence": "low"}
+
+def seasonal_analysis(company_id: int) -> dict:
+    """Monthly calibration volume over 24 months. Flags months >1.5x average."""
+    try:
+        tools = sb_get("tools", {"select": "id", "company_id": f"eq.{company_id}", "active": "eq.true"})
+        if not tools:
+            return {"monthly_counts": {}, "peak_months": [], "avg_monthly": 0}
+        tool_ids = ",".join(str(t["id"]) for t in tools)
+        cutoff_start = (date.today().replace(day=1) - timedelta(days=730)).isoformat()
+        cals = sb_get("calibrations", {
+            "select": "calibration_date",
+            f"tool_id": f"in.({tool_ids})",
+            "calibration_date": f"gte.{cutoff_start}",
+        })
+        monthly: dict = {}
+        for c in cals:
+            d = c.get("calibration_date", "")
+            if not d or len(d) < 7:
+                continue
+            month_key = str(d)[:7]  # YYYY-MM
+            monthly[month_key] = monthly.get(month_key, 0) + 1
+        if not monthly:
+            return {"monthly_counts": {}, "peak_months": [], "avg_monthly": 0}
+        avg = sum(monthly.values()) / len(monthly)
+        peak_months = [m for m, cnt in monthly.items() if cnt > avg * 1.5]
+        return {
+            "monthly_counts": dict(sorted(monthly.items())),
+            "peak_months": sorted(peak_months),
+            "avg_monthly": round(avg, 1),
+        }
+    except Exception as e:
+        logger.warning(f"[ANALYTICS] seasonal_analysis: {e}")
+        return {"monthly_counts": {}, "peak_months": [], "avg_monthly": 0}
 
 def _build_tool_table_html(tools: list) -> str:
     """Build an HTML table of tools for email."""
@@ -1224,6 +1712,10 @@ def enforcement_scan():
         if not kernel_path.exists():
             continue  # no kernel = not onboarded
 
+        # Load per-company notification recipients from cal.settings
+        notify = _get_company_settings(cid)
+        signature = _build_email_signature(cid)
+
         tools = sb_get("tools", {
             "select": "id,asset_tag,tool_name,tool_type,calibration_method,calibrating_entity,calibration_status,next_due_date",
             "company_id": f"eq.{cid}",
@@ -1264,15 +1756,17 @@ def enforcement_scan():
 <li>Schedule calibration with approved vendor immediately</li>
 <li>Document removal in quality records</li>
 </ul>
-<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent<br>This is an automated enforcement notice. Do not reply to this email.</p>
+{signature}
 </div>"""
-            # Bunting routing: overdue → Ryan + Brandon
-            to = "rlinton@buntingmagnetics.com"
-            cc = "bdick@buntingmagnetics.com"
-            sent = _send_mailgun(sender, to, f"[ACTION REQUIRED] {len(overdue)} Overdue Calibrations — Remove From Service", body, cc)
-            _log_email(cid, sender, to, f"[ACTION REQUIRED] {len(overdue)} Overdue Calibrations", body, "sent" if sent else "failed")
-            if sent:
-                total_emails += 1
+            to = notify.get("notify_overdue_to", "")
+            cc = notify.get("notify_overdue_cc", "")
+            if not to:
+                logger.warning(f"[CRON] notify_overdue_to not set for company {cid} — skipping overdue email")
+            else:
+                sent = _send_mailgun(sender, to, f"[ACTION REQUIRED] {len(overdue)} Overdue Calibrations — Remove From Service", body, cc)
+                _log_email(cid, sender, to, f"[ACTION REQUIRED] {len(overdue)} Overdue Calibrations", body, "sent" if sent else "failed")
+                if sent:
+                    total_emails += 1
 
         # --- CRITICAL: Due within 7 days ---
         if critical:
@@ -1282,13 +1776,17 @@ def enforcement_scan():
 <p>The following tools require calibration within the next 7 days:</p>
 {table_html}
 <p><strong>Action:</strong> Schedule these calibrations immediately to avoid overdue status.</p>
-<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent</p>
+{signature}
 </div>"""
-            to = "bdick@buntingmagnetics.com"
-            sent = _send_mailgun(sender, to, f"[URGENT] {len(critical)} Calibrations Due Within 7 Days", body)
-            _log_email(cid, sender, to, f"[URGENT] {len(critical)} Calibrations Due Within 7 Days", body, "sent" if sent else "failed")
-            if sent:
-                total_emails += 1
+            to = notify.get("notify_critical_to", "")
+            cc = notify.get("notify_critical_cc", "")
+            if not to:
+                logger.warning(f"[CRON] notify_critical_to not set for company {cid} — skipping critical email")
+            else:
+                sent = _send_mailgun(sender, to, f"[URGENT] {len(critical)} Calibrations Due Within 7 Days", body, cc)
+                _log_email(cid, sender, to, f"[URGENT] {len(critical)} Calibrations Due Within 7 Days", body, "sent" if sent else "failed")
+                if sent:
+                    total_emails += 1
 
         # --- WARNING: Due within 30 days ---
         if warning:
@@ -1299,14 +1797,17 @@ def enforcement_scan():
 <h2 style="color:#003366;">[NOTICE] {len(warning)} Calibrations Due Within 30 Days</h2>
 <p>Plan ahead — the following tools need calibration soon:</p>
 {table_html}
-<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent</p>
+{signature}
 </div>"""
-            to = "dsanchez@buntingmagnetics.com"
-            cc = "bdick@buntingmagnetics.com"
-            sent = _send_mailgun(sender, to, f"[NOTICE] {len(warning)} Calibrations Due Within 30 Days", body, cc)
-            _log_email(cid, sender, to, f"[NOTICE] {len(warning)} Calibrations Due Within 30 Days", body, "sent" if sent else "failed")
-            if sent:
-                total_emails += 1
+            to = notify.get("notify_warning_to", "")
+            cc = notify.get("notify_warning_cc", "")
+            if not to:
+                logger.warning(f"[CRON] notify_warning_to not set for company {cid} — skipping warning email")
+            else:
+                sent = _send_mailgun(sender, to, f"[NOTICE] {len(warning)} Calibrations Due Within 30 Days", body, cc)
+                _log_email(cid, sender, to, f"[NOTICE] {len(warning)} Calibrations Due Within 30 Days", body, "sent" if sent else "failed")
+                if sent:
+                    total_emails += 1
 
             # --- PURCHASING: Vendor-calibrated tools need PO ---
             if vendor_tools:
@@ -1316,14 +1817,17 @@ def enforcement_scan():
 <p>The following vendor-calibrated tools are due within 30 days. Please initiate purchase orders with the listed calibrating entities:</p>
 {vendor_table}
 <p><strong>Contact the Quality Department for vendor details and shipping instructions.</strong></p>
-<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent</p>
+{signature}
 </div>"""
-                to = "purchasing@buntingmagnetics.com"
-                cc = "bdick@buntingmagnetics.com"
-                sent = _send_mailgun(sender, to, f"[CAL REQUEST] {len(vendor_tools)} Tools Need Vendor Calibration", po_body, cc)
-                _log_email(cid, sender, to, f"[CAL REQUEST] {len(vendor_tools)} Vendor Calibrations", po_body, "sent" if sent else "failed")
-                if sent:
-                    total_emails += 1
+                to = notify.get("notify_purchasing_to", "")
+                cc = notify.get("notify_purchasing_cc", "")
+                if not to:
+                    logger.warning(f"[CRON] notify_purchasing_to not set for company {cid} — skipping purchasing email")
+                else:
+                    sent = _send_mailgun(sender, to, f"[CAL REQUEST] {len(vendor_tools)} Tools Need Vendor Calibration", po_body, cc)
+                    _log_email(cid, sender, to, f"[CAL REQUEST] {len(vendor_tools)} Vendor Calibrations", po_body, "sent" if sent else "failed")
+                    if sent:
+                        total_emails += 1
 
     logger.info(f"[CRON] enforcement_scan: sent {total_emails} emails")
     return total_emails
@@ -1341,6 +1845,9 @@ def weekly_summary():
         kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
         if not kernel_path.exists():
             continue
+
+        notify = _get_company_settings(cid)
+        signature = _build_email_signature(cid)
 
         tools = sb_get("tools", {
             "select": "id,calibration_status,next_due_date,tool_type",
@@ -1384,15 +1891,61 @@ def weekly_summary():
 <tr style="background:#003366;color:white;"><th>Type</th><th>Count</th></tr>
 {type_rows}
 </table>
-
-<p style="color:#666;font-size:11px;margin-top:24px;">— Cal | {co_name} Calibration Agent<br>{co_name} Quality Department</p>
-</div>"""
-        to = "rlinton@buntingmagnetics.com"
-        cc = "bdick@buntingmagnetics.com"
-        sent = _send_mailgun(sender, to, f"Weekly Calibration Summary — {compliance_pct}% Compliant", body, cc)
-        _log_email(cid, sender, to, f"Weekly Calibration Summary", body, "sent" if sent else "failed")
-        if sent:
-            total_emails += 1
+"""
+        # --- Analytics: failure rates ---
+        fail_rates = failure_rate_by_type(cid)
+        flagged_types = [r for r in fail_rates if r["flagged"]]
+        if flagged_types:
+            fail_rows = "".join(
+                f"<tr style='color:red;'><td>{r['tool_type']}</td><td>{r['failure_pct']}%</td><td>{r['failures']}/{r['total']}</td></tr>"
+                for r in flagged_types
+            )
+            body += f"""<h3 style="color:#CC0000;">⚠ High Failure Rate Alert</h3>
+<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+<tr style="background:#CC0000;color:white;"><th>Tool Type</th><th>Failure Rate</th><th>Failures/Total</th></tr>
+{fail_rows}
+</table>
+<p style="font-size:12px;">Tools in these categories have fail/OOT rates above 10%. Review calibration procedures or reduce intervals.</p>
+"""
+        # --- Analytics: vendor turnaround ---
+        turnaround = vendor_turnaround_report(cid)
+        exceeded = [v for v in turnaround if v["sla_exceeded"]]
+        if exceeded:
+            ta_rows = "".join(
+                f"<tr style='color:orange;'><td>{v['vendor']}</td><td>{v['avg_turnaround_days']}d</td><td>{v['sla_days']}d</td><td>{v['sample_size']}</td></tr>"
+                for v in exceeded
+            )
+            body += f"""<h3 style="color:#CC6600;">⚠ Vendor SLA Violations</h3>
+<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+<tr style="background:#CC6600;color:white;"><th>Vendor</th><th>Avg Turnaround</th><th>SLA</th><th>Samples</th></tr>
+{ta_rows}
+</table>
+"""
+        # --- Analytics: cost projection ---
+        proj = cost_projection(cid, days=90)
+        if proj["total_estimated"] > 0:
+            cost_rows = "".join(
+                f"<tr><td>{b['tool_type']}</td><td>{b['upcoming_count']}</td><td>${b['avg_historical_cost']:.2f}</td><td><strong>${b['estimated']:.2f}</strong></td></tr>"
+                for b in proj["by_type"]
+            )
+            body += f"""<h3>90-Day Cost Projection</h3>
+<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px;">
+<tr style="background:#003366;color:white;"><th>Type</th><th>Count Due</th><th>Avg Cost</th><th>Estimated</th></tr>
+{cost_rows}
+<tr style="background:#f0f0f0;"><td colspan="3"><strong>Total Estimate</strong></td><td><strong>${proj['total_estimated']:.2f}</strong></td></tr>
+</table>
+<p style="font-size:11px;color:#666;">Confidence: {proj['confidence']} (based on historical records)</p>
+"""
+        body += f'{signature}\n</div>'
+        to = notify.get("notify_summary_to", "")
+        cc = notify.get("notify_summary_cc", "")
+        if not to:
+            logger.warning(f"[CRON] notify_summary_to not set for company {cid} — skipping weekly summary")
+        else:
+            sent = _send_mailgun(sender, to, f"Weekly Calibration Summary — {compliance_pct}% Compliant", body, cc)
+            _log_email(cid, sender, to, f"Weekly Calibration Summary", body, "sent" if sent else "failed")
+            if sent:
+                total_emails += 1
 
     logger.info(f"[CRON] weekly_summary: sent {total_emails} emails")
     return total_emails
@@ -1566,13 +2119,74 @@ def extract_tenant_from_email(to_address: str) -> str | None:
     match = re.match(r'cal@([^.]+)\.gp3\.app', to_address.lower().strip())
     return match.group(1) if match else None
 
+@app.post("/api/email/mailgun-raw")
+async def mailgun_raw_ingest(request: Request, secret: str = ""):
+    """Mailgun inbound webhook — raw form-encoded POST.
+    Normalizes to EmailWebhook shape and forwards to ingest_email().
+    No JWT auth — secured by ?secret= query param OR Mailgun HMAC signature.
+    Set route in Mailgun: forward("https://cal.gp3.app/api/email/mailgun-raw?secret=YOUR_SECRET")
+    """
+    import hmac, hashlib
+    form = await request.form()
+
+    # Auth: accept query param secret OR Mailgun HMAC signature (either suffices)
+    authenticated = False
+
+    if EMAIL_WEBHOOK_SECRET and secret:
+        if hmac.compare_digest(secret, EMAIL_WEBHOOK_SECRET):
+            authenticated = True
+
+    timestamp  = form.get("timestamp", "")
+    mg_token   = form.get("token", "")
+    signature  = form.get("signature", "")
+    if MAILGUN_API_KEY and timestamp and mg_token and signature:
+        value  = f"{timestamp}{mg_token}".encode()
+        digest = hmac.new(MAILGUN_API_KEY.encode(), value, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(digest, signature):
+            authenticated = True
+
+    # If neither EMAIL_WEBHOOK_SECRET nor MAILGUN_API_KEY is set, allow through (dev)
+    if EMAIL_WEBHOOK_SECRET or MAILGUN_API_KEY:
+        if not authenticated:
+            raise HTTPException(status_code=403, detail="Invalid webhook credentials")
+
+    # Build attachment list from Mailgun's multipart
+    attachments = []
+    attach_count = int(form.get("attachment-count", 0))
+    for i in range(1, attach_count + 1):
+        f = form.get(f"attachment-{i}")
+        if f and hasattr(f, "filename"):
+            content_bytes = await f.read()
+            import base64
+            attachments.append({
+                "filename":     f.filename,
+                "content_type": f.content_type or "application/octet-stream",
+                "size":         len(content_bytes),
+                "url_or_base64": base64.b64encode(content_bytes).decode(),
+            })
+
+    payload = EmailWebhook(
+        from_address = form.get("sender") or form.get("From", ""),
+        to_address   = form.get("recipient") or form.get("To", ""),
+        cc           = form.get("Cc", ""),
+        subject      = form.get("subject") or form.get("Subject", ""),
+        body_text    = form.get("body-plain", ""),
+        body_html    = form.get("body-html", ""),
+        message_id   = form.get("Message-Id", ""),
+        in_reply_to  = form.get("In-Reply-To", ""),
+        attachments  = attachments,
+        webhook_secret = "",  # already verified by signature above
+    )
+    return await ingest_email(payload)
+
+
 @app.post("/api/email/ingest")
 async def ingest_email(payload: EmailWebhook):
     """Receive inbound email for Cal agent.
     Called by email webhook (Cloudflare Email Workers / Mailgun).
     No JWT auth — secured by webhook secret.
     """
-    # Verify webhook secret
+    # Verify webhook secret (only when called directly, not via mailgun-raw)
     if EMAIL_WEBHOOK_SECRET and payload.webhook_secret != EMAIL_WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
@@ -1647,11 +2261,55 @@ Return ONLY a JSON object: {"category": "CATEGORY", "summary": "1-sentence summa
     actions_taken = []
 
     if result_data.get("category") == "CERTIFICATE" and payload.attachments:
-        # Process PDF attachments as calibration certificates
+        # Process PDF/image attachments as calibration certificates
         for att in payload.attachments:
-            if att.get("content_type", "").startswith(("application/pdf", "image/")):
-                actions_taken.append(f"Certificate attachment '{att.get('filename')}' queued for processing")
-                # TODO: decode base64 attachment, run through existing upload/extraction flow
+            ct = att.get("content_type", "")
+            if not ct.startswith(("application/pdf", "image/")):
+                continue
+            filename = att.get("filename", "cert.pdf")
+            url_or_b64 = att.get("url_or_base64", "")
+            try:
+                if url_or_b64.startswith("http"):
+                    # Download from Mailgun stored URL
+                    dl = httpx.get(url_or_b64,
+                                   auth=("api", MAILGUN_API_KEY) if MAILGUN_API_KEY else None,
+                                   timeout=30)
+                    dl.raise_for_status()
+                    content_bytes = dl.content
+                else:
+                    import base64
+                    content_bytes = base64.b64decode(url_or_b64)
+                cert_result = _process_cert_attachment(
+                    company_id, filename, content_bytes, ct, email_log_id=email_log_id
+                )
+                if cert_result["status"] == "success":
+                    actions_taken.append(f"Cert '{filename}' processed — tool updated, next due {cert_result['data'].get('next_due_date')}")
+                    # Send confirmation to sender
+                    if MAILGUN_API_KEY:
+                        slug = tenant_slug
+                        sender_addr = f"Cal <cal@{slug}.gp3.app>"
+                        confirm_body = (f"Hi,\n\nI received the calibration certificate for "
+                                       f"{cert_result['data'].get('tool_number', 'your tool')} and updated "
+                                       f"the record. Next calibration due: {cert_result['data'].get('next_due_date', 'unknown')}.\n\n"
+                                       f"— Cal, {slug.title()} Calibration Agent")
+                        _send_mailgun(sender_addr, payload.from_address,
+                                     f"Re: {payload.subject} — Record Updated", confirm_body)
+                elif cert_result["status"] == "unmatched":
+                    actions_taken.append(f"Cert '{filename}' — tool '{cert_result.get('extracted_data', {}).get('tool_number')}' not in registry")
+                    if MAILGUN_API_KEY:
+                        slug = tenant_slug
+                        _send_mailgun(
+                            f"Cal <cal@{slug}.gp3.app>", payload.from_address,
+                            f"Re: {payload.subject} — Tool Not Found",
+                            f"Hi,\n\nI received a cert for tool '{cert_result.get('extracted_data', {}).get('tool_number')}' "
+                            f"but it's not in the equipment registry. Please add the tool first at cal.gp3.app, "
+                            f"then resend this certificate.\n\n— Cal"
+                        )
+                else:
+                    actions_taken.append(f"Cert '{filename}' extraction error: {cert_result.get('message')}")
+            except Exception as e:
+                logger.warning(f"[EMAIL_INGEST] Attachment processing failed for {filename}: {e}")
+                actions_taken.append(f"Cert '{filename}' — processing error, needs manual review")
 
     elif result_data.get("category") == "PO_NOTIFICATION":
         actions_taken.append("PO notification logged — Cal will track expected return")
@@ -1775,4 +2433,124 @@ async def get_email_log(
             }
             for e in emails
         ],
+    }
+
+# ============================================================
+# ANALYTICS ENDPOINTS (Fix 3, 4, 5, 9, 10)
+# ============================================================
+
+@app.get("/cal/analytics/failure-rates")
+async def api_failure_rates(auth: dict = Depends(verify_token)):
+    """Failure/OOT rate per tool_type. Flags types >10%."""
+    return {"failure_rates": failure_rate_by_type(auth["company_id"])}
+
+@app.get("/cal/analytics/interval-variance")
+async def api_interval_variance(auth: dict = Depends(verify_token)):
+    """Actual vs planned calibration interval by tool_type."""
+    return {"interval_variance": interval_variance_report(auth["company_id"])}
+
+@app.get("/cal/analytics/vendor-turnaround")
+async def api_vendor_turnaround(auth: dict = Depends(verify_token)):
+    """Vendor avg turnaround vs SLA."""
+    return {"vendor_turnaround": vendor_turnaround_report(auth["company_id"])}
+
+@app.get("/cal/analytics/cost-projection")
+async def api_cost_projection(days: int = 90, auth: dict = Depends(verify_token)):
+    """Projected calibration cost for next {days} days."""
+    return cost_projection(auth["company_id"], days=days)
+
+@app.get("/cal/analytics/seasonal")
+async def api_seasonal(auth: dict = Depends(verify_token)):
+    """Monthly calibration volume with peak month detection."""
+    return seasonal_analysis(auth["company_id"])
+
+# ============================================================
+# TENANT PROVISIONING (called by onboard engine / pipeline)
+# ============================================================
+
+class ProvisionRequest(BaseModel):
+    company_name: str
+    slug: str
+    plan: str = "professional"
+    admin_email: str
+    admin_name: str
+    contact_phone: str = ""
+
+@app.post("/cal/provision")
+async def provision_tenant(req: ProvisionRequest, request: Request):
+    """
+    Create a new tenant: company + admin user + default settings.
+    Auth: CAL_SERVICE_KEY in X-Service-Key header.
+    Called by the onboard engine after Stripe payment + agreement signing.
+    """
+    service_key = request.headers.get("x-service-key", "")
+    if service_key != CAL_SERVICE_KEY:
+        raise HTTPException(status_code=403, detail="Invalid service key")
+
+    # Check slug uniqueness
+    existing = sb_get("companies", {"slug": f"eq.{req.slug}", "select": "id"})
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Company slug '{req.slug}' already exists")
+
+    # 1. Create company (columns: id, name, slug, subscription_plan, max_users, max_tools, is_active)
+    # id has no auto-increment default — generate next id manually
+    plan_limits = {
+        "basic": {"max_users": 3, "max_tools": 50},
+        "professional": {"max_users": 10, "max_tools": 200},
+        "enterprise": {"max_users": 50, "max_tools": 1000},
+    }
+    limits = plan_limits.get(req.plan, plan_limits["professional"])
+    all_companies = sb_get("companies", {"select": "id", "order": "id.desc", "limit": "1"})
+    next_company_id = (all_companies[0]["id"] + 1) if all_companies else 1
+    company = sb_post("companies", {
+        "id": next_company_id,
+        "name": req.company_name,
+        "slug": req.slug,
+        "subscription_plan": req.plan,
+        "max_users": limits["max_users"],
+        "max_tools": limits["max_tools"],
+        "is_active": True,
+    })
+    company_id = company["id"]
+
+    # 2. Create admin user with generated password (id also has no auto-increment)
+    temp_password = uuid.uuid4().hex[:12]
+    name_parts = req.admin_name.strip().split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+    all_users = sb_get("users", {"select": "id", "order": "id.desc", "limit": "1"})
+    next_user_id = (all_users[0]["id"] + 1) if all_users else 1
+    admin_user = sb_post("users", {
+        "id": next_user_id,
+        "email": req.admin_email,
+        "password_hash": pwd_context.hash(temp_password),
+        "first_name": first_name,
+        "last_name": last_name,
+        "role": "company_admin",
+        "company_id": company_id,
+        "is_active": True,
+    })
+
+    # 3. Seed default settings for the company
+    default_settings = [
+        {"company_id": company_id, "key": "cal_interval_default", "value": "365"},
+        {"company_id": company_id, "key": "alert_days_before_due", "value": "30"},
+        {"company_id": company_id, "key": "max_tools_limit", "value": str(limits["max_tools"])},
+        {"company_id": company_id, "key": "ai_analysis_enabled", "value": "true"},
+    ]
+    for setting in default_settings:
+        try:
+            sb_post("settings", setting)
+        except Exception:
+            pass  # non-critical if settings seed fails
+
+    logger.info(f"Provisioned tenant: {req.company_name} (id={company_id}, slug={req.slug})")
+
+    return {
+        "company_id": company_id,
+        "slug": req.slug,
+        "admin_email": req.admin_email,
+        "temp_password": temp_password,
+        "login_url": f"https://cal.gp3.app/login",
+        "plan": req.plan,
     }
