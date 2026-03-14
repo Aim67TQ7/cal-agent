@@ -9,6 +9,7 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta, date
 from pathlib import Path
+from backend.gp3_kernel_loader import load_kernel
 import os
 import re
 import io
@@ -172,15 +173,23 @@ def require_admin(auth: dict = Depends(verify_token)):
 # KERNEL LOADER
 # ============================================================
 
-def load_tenant_kernel(db_unused, company_id: int) -> str:
-    """Load two-layer kernel: agent kernel (shared) + tenant kernel (per-customer)."""
+_CAL_FALLBACK = "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
 
-    # Layer 1: Agent kernel
-    agent_kernel_path = Path("/app/kernels/calibrations_v1.0.ttc.md")
-    if agent_kernel_path.exists():
-        agent_kernel = agent_kernel_path.read_text()
-    else:
-        agent_kernel = "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
+# Tenant UUID map — maps Cal company_id to gp3_kernels tenant_id
+_TENANT_MAP = {
+    1: "a0000000-0000-0000-0000-000000000001",  # Default (n0v8v)
+    2: "a0000000-0000-0000-0000-000000000001",  # Demo
+    3: "d505483a-e07b-4376-b198-d9de5fd9a2bd",  # Bunting Magnetics
+}
+_N0V8V_TENANT = "a0000000-0000-0000-0000-000000000001"
+
+
+def load_tenant_kernel(db_unused, company_id: int) -> str:
+    """Load two-layer kernel: gp3_kernels DB (primary) + equipment context injection."""
+
+    # Layer 1: Agent kernel from gp3_kernels table
+    tenant_uuid = _TENANT_MAP.get(company_id, _N0V8V_TENANT)
+    agent_kernel = load_kernel("cal", tenant_uuid, fallback=_CAL_FALLBACK)
 
     # Get company info via REST
     try:
@@ -189,7 +198,6 @@ def load_tenant_kernel(db_unused, company_id: int) -> str:
     except Exception:
         company = {}
     company_name = company.get("name", "Unknown")
-    company_slug = company.get("slug", "unknown")
 
     # Get equipment registry via REST
     try:
@@ -206,17 +214,9 @@ def load_tenant_kernel(db_unused, company_id: int) -> str:
         for eq in equipment
     ]) or "  No equipment registered yet."
 
-    # Inject variables into agent kernel
+    # Inject runtime variables into kernel
     kernel = agent_kernel.replace("{TENANT_NAME}", company_name)
     kernel = kernel.replace("{EQUIPMENT_LIST}", equipment_list)
-
-    # Layer 2: Tenant kernel — per-customer customizations
-    tenant_kernel_path = Path(f"/app/kernels/tenants/{company_slug}.ttc.md")
-    if tenant_kernel_path.exists():
-        tenant_kernel = tenant_kernel_path.read_text()
-        tenant_kernel = tenant_kernel.replace("{TENANT_NAME}", company_name)
-        tenant_kernel = tenant_kernel.replace("{EQUIPMENT_LIST}", equipment_list)
-        kernel = kernel + "\n\n---\n\n" + tenant_kernel
 
     return kernel
 
