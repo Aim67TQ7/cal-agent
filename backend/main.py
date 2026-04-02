@@ -1,15 +1,13 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, Session
+from supabase import create_client, Client
 from anthropic import Anthropic
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta, date
 from pathlib import Path
-from backend.gp3_kernel_loader import load_kernel
 import os
 import re
 import io
@@ -23,15 +21,25 @@ logger = logging.getLogger("cal-agent")
 # APP SETUP
 # ============================================================
 
+# Load .gp3 kernel for Cal Agent identity
+def _load_cal_kernel():
+    try:
+        with open("/opt/gp3-kernels/cal-agent.gp3", "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+CAL_KERNEL = _load_cal_kernel()
+
+
 app = FastAPI(
     title="cal.gp3.app - Calibration Agent",
     description="Multi-tenant calibration management powered by AI",
-    version="2.6.0",
+    version="3.1.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://cal.gp3.app", "https://portal.gp3.app", "http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["https://cal.gp3.app", "https://portal.gp3.app", "https://auth.gp3.app", "http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,66 +49,115 @@ app.add_middleware(
 # CONFIG
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Supabase direct connection string (may be None)
 SECRET_KEY = os.getenv("SECRET_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ezlmmegowggujpcnzoda.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY", "")
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 7
 
-# SQLAlchemy — optional, may fail if no DB connection
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
+
+sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+# SSO middleware
 try:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10) if DATABASE_URL else None
-    SessionLocal = sessionmaker(bind=engine) if engine else None
-except Exception:
-    engine = None
-    SessionLocal = None
+    from gp3_auth import get_gp3_user
+    SSO_AVAILABLE = True
+except ImportError:
+    SSO_AVAILABLE = False
+
+
+
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ============================================================
-# SUPABASE REST CLIENT (replaces direct Postgres when unavailable)
+# SUPABASE SDK CLIENT (cal schema)
 # ============================================================
 
-import httpx
+import httpx  # kept for Mailgun, Storage, and external API calls only
 
-_sb_headers = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Accept-Profile": "cal",
-    "Content-Profile": "cal",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation",
-}
+def cal_table(name: str):
+    """Get a PostgREST query builder scoped to the cal schema."""
+    return sb.postgrest.schema("cal").from_(name)
+
+def _apply_filters(q, params: dict):
+    """Apply PostgREST-style filters from a params dict to a query builder."""
+    p = dict(params)
+    select_cols = p.pop("select", "*")
+    order_clause = p.pop("order", None)
+    limit_val = p.pop("limit", None)
+
+    q = q.select(select_cols)
+
+    for key, val in p.items():
+        val = str(val)
+        if key.startswith("not.") and ".is" in key:
+            col = key[4:].replace(".is", "")
+            q = q.not_.is_(col, val)
+        elif val.startswith("eq."):
+            q = q.eq(key, val[3:])
+        elif val.startswith("neq."):
+            q = q.neq(key, val[4:])
+        elif val.startswith("gt."):
+            q = q.gt(key, val[3:])
+        elif val.startswith("gte."):
+            q = q.gte(key, val[4:])
+        elif val.startswith("lt."):
+            q = q.lt(key, val[3:])
+        elif val.startswith("lte."):
+            q = q.lte(key, val[4:])
+        elif val.startswith("in.("):
+            vals = val[4:-1].split(",")
+            q = q.in_(key, [v.strip() for v in vals])
+        elif val.startswith("is."):
+            q = q.is_(key, val[3:])
+        elif val.startswith("like."):
+            q = q.like(key, val[5:])
+        elif val.startswith("ilike."):
+            q = q.ilike(key, val[6:])
+
+    if order_clause:
+        for part in order_clause.split(","):
+            part = part.strip()
+            desc = ".desc" in part
+            col = part.split(".")[0]
+            q = q.order(col, desc=desc)
+
+    if limit_val:
+        q = q.limit(int(limit_val))
+
+    return q
 
 def sb_get(table: str, params: dict = None) -> list:
-    """GET from Supabase REST API (cal schema)."""
-    r = httpx.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers, params=params or {}, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    """SELECT from cal schema via Supabase SDK."""
+    q = cal_table(table)
+    if not params:
+        return q.select("*").execute().data or []
+    q = _apply_filters(q, params)
+    return q.execute().data or []
 
 def sb_post(table: str, data: dict) -> dict:
-    """INSERT into Supabase REST API (cal schema)."""
-    r = httpx.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers, json=data, timeout=15)
-    r.raise_for_status()
-    result = r.json()
-    return result[0] if isinstance(result, list) and result else result
+    """INSERT into cal schema via Supabase SDK."""
+    result = cal_table(table).insert(data).execute()
+    return result.data[0] if result.data else {}
 
 def sb_patch(table: str, params: dict, data: dict) -> list:
-    """UPDATE via Supabase REST API (cal schema)."""
-    r = httpx.patch(f"{SUPABASE_URL}/rest/v1/{table}", headers=_sb_headers, params=params, json=data, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    """UPDATE cal schema via Supabase SDK. Params are eq filters for WHERE."""
+    q = cal_table(table).update(data)
+    for key, val in params.items():
+        val = str(val)
+        if val.startswith("eq."):
+            q = q.eq(key, val[3:])
+    return q.execute().data or []
 
 def sb_rpc(fn_name: str, params: dict = None) -> any:
-    """Call a Supabase RPC function."""
-    r = httpx.post(f"{SUPABASE_URL}/rest/v1/rpc/{fn_name}", headers=_sb_headers, json=params or {}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    """Call a Supabase RPC function via SDK."""
+    return sb.rpc(fn_name, params or {}).execute().data
 
 # ============================================================
 # MODELS
@@ -138,30 +195,86 @@ class EquipmentCreate(BaseModel):
     cal_interval_days: int = 365
     notes: str = ""
 
+
+# Standard challenge questions for password reset
+CHALLENGE_QUESTIONS = [
+    "What city were you born in?",
+    "What is your mother's maiden name?",
+    "What was the name of your first pet?",
+    "What street did you grow up on?",
+    "What was your childhood nickname?",
+    "What is the name of your favorite childhood friend?",
+    "What was the make of your first car?",
+    "What school did you attend for sixth grade?",
+    "What year did you graduate high school?",
+    "What is your favorite sports team?",
+]
+
+
+class ChallengeSetupRequest(BaseModel):
+    """Set 3 challenge Q&A pairs after first login."""
+    new_password: str  # user must set their own password
+    question_1: str
+    answer_1: str
+    question_2: str
+    answer_2: str
+    question_3: str
+    answer_3: str
+
+
+class ChallengeResetRequest(BaseModel):
+    """Reset password by answering challenge questions."""
+    email: str
+    answer_1: str
+    answer_2: str
+    answer_3: str
+    new_password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
 # ============================================================
 # DEPENDENCIES
 # ============================================================
 
-def get_db():
-    if SessionLocal:
-        db = SessionLocal()
-        try:
-            yield db
-        finally:
-            db.close()
-    else:
-        yield None  # No direct DB — using Supabase REST
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        return {
-            "user_id": payload["user_id"],
-            "company_id": payload["company_id"],
-            "role": payload.get("role", "user"),
-        }
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+def verify_token(
+    request: Request = None,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    # Mode 1: GP3 SSO cookie
+    if SSO_AVAILABLE and request:
+        try:
+            profile = get_gp3_user(request)
+            allowed = profile.get("allowed_apps") or []
+            if "cal" not in allowed and profile.get("role") != "admin":
+                raise HTTPException(status_code=403, detail="No access to Calibration Manager")
+            return {
+                "user_id": profile.get("id") or profile.get("auth_id"),
+                "company_id": profile.get("company_id") or 1,
+                "role": profile.get("role", "user"),
+                "_sso": True,
+            }
+        except HTTPException as e:
+            if e.status_code == 403:
+                raise
+            pass
+
+    # Mode 2: Legacy cal JWT
+    if credentials and credentials.credentials:
+        try:
+            payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+            return {
+                "user_id": payload["user_id"],
+                "company_id": payload["company_id"],
+                "role": payload.get("role", "user"),
+            }
+        except JWTError:
+            pass
+
+    raise HTTPException(status_code=401, detail="Not authenticated")
 
 def require_admin(auth: dict = Depends(verify_token)):
     """Dependency: require admin role. Apply to write-mutating endpoints."""
@@ -173,23 +286,15 @@ def require_admin(auth: dict = Depends(verify_token)):
 # KERNEL LOADER
 # ============================================================
 
-_CAL_FALLBACK = "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
-
-# Tenant UUID map — maps Cal company_id to gp3_kernels tenant_id
-_TENANT_MAP = {
-    1: "a0000000-0000-0000-0000-000000000001",  # Default (n0v8v)
-    2: "a0000000-0000-0000-0000-000000000001",  # Demo
-    3: "d505483a-e07b-4376-b198-d9de5fd9a2bd",  # Bunting Magnetics
-}
-_N0V8V_TENANT = "a0000000-0000-0000-0000-000000000001"
-
-
 def load_tenant_kernel(db_unused, company_id: int) -> str:
-    """Load two-layer kernel: gp3_kernels DB (primary) + equipment context injection."""
+    """Load two-layer kernel: agent kernel (shared) + tenant kernel (per-customer)."""
 
-    # Layer 1: Agent kernel from gp3_kernels table
-    tenant_uuid = _TENANT_MAP.get(company_id, _N0V8V_TENANT)
-    agent_kernel = load_kernel("cal", tenant_uuid, fallback=_CAL_FALLBACK)
+    # Layer 1: Agent kernel
+    agent_kernel_path = Path("/app/kernels/calibrations_v1.0.ttc.md")
+    if agent_kernel_path.exists():
+        agent_kernel = agent_kernel_path.read_text()
+    else:
+        agent_kernel = "You are a calibration management assistant. Help users manage equipment calibration schedules, upload certificates, and generate audit evidence."
 
     # Get company info via REST
     try:
@@ -198,6 +303,7 @@ def load_tenant_kernel(db_unused, company_id: int) -> str:
     except Exception:
         company = {}
     company_name = company.get("name", "Unknown")
+    company_slug = company.get("slug", "unknown")
 
     # Get equipment registry via REST
     try:
@@ -214,9 +320,17 @@ def load_tenant_kernel(db_unused, company_id: int) -> str:
         for eq in equipment
     ]) or "  No equipment registered yet."
 
-    # Inject runtime variables into kernel
+    # Inject variables into agent kernel
     kernel = agent_kernel.replace("{TENANT_NAME}", company_name)
     kernel = kernel.replace("{EQUIPMENT_LIST}", equipment_list)
+
+    # Layer 2: Tenant kernel — per-customer customizations
+    tenant_kernel_path = Path(f"/app/kernels/tenants/{company_slug}.ttc.md")
+    if tenant_kernel_path.exists():
+        tenant_kernel = tenant_kernel_path.read_text()
+        tenant_kernel = tenant_kernel.replace("{TENANT_NAME}", company_name)
+        tenant_kernel = tenant_kernel.replace("{EQUIPMENT_LIST}", equipment_list)
+        kernel = kernel + "\n\n---\n\n" + tenant_kernel
 
     return kernel
 
@@ -437,6 +551,86 @@ def call_agent(kernel: str, user_message: str, context: str = "") -> dict:
         "output_tokens": response.usage.output_tokens,
     }
 
+
+# ============================================================
+# USAGE METERING (GAP_01)
+# ============================================================
+
+# Plan-level AI cost caps (USD/month)
+PLAN_AI_CAPS = {
+    "basic": 5.0,
+    "founder": 10.0,
+    "professional": 25.0,
+    "enterprise": 75.0,
+    "premium": 25.0,
+    "lifetime_free": 999.0,
+}
+
+PLAN_FEATURES = {
+    "basic":         {"max_tools": 50,   "max_users": 3,  "ai_cost_cap": 5.0,   "branded_pdf": False, "api_access": False},
+    "founder":       {"max_tools": 200,  "max_users": 10, "ai_cost_cap": 10.0,  "branded_pdf": False, "api_access": False},
+    "professional":  {"max_tools": 500,  "max_users": 15, "ai_cost_cap": 25.0,  "branded_pdf": True,  "api_access": "read"},
+    "enterprise":    {"max_tools": 9999, "max_users": 50, "ai_cost_cap": 75.0,  "branded_pdf": True,  "api_access": "full"},
+    "premium":       {"max_tools": 500,  "max_users": 15, "ai_cost_cap": 25.0,  "branded_pdf": True,  "api_access": "read"},
+    "lifetime_free": {"max_tools": 9999, "max_users": 50, "ai_cost_cap": 999.0, "branded_pdf": True,  "api_access": "full"},
+}
+
+
+ALERT_MILESTONES = [30, 14, 7, 3, 1, 0]  # days before due date
+
+def _get_monthly_ai_cost(company_id: int) -> float:
+    """Get total AI cost for current billing month."""
+    month_start = date.today().replace(day=1).isoformat()
+    try:
+        usage = sb_get("usage_log", {
+            "select": "cost_usd",
+            "company_id": f"eq.{company_id}",
+            "created_at": f"gte.{month_start}",
+        })
+        return sum(float(u.get("cost_usd", 0)) for u in usage)
+    except Exception:
+        return 0.0
+
+def _log_usage(company_id: int, user_id: int | None, endpoint: str, tokens_in: int, tokens_out: int):
+    """Log a metered AI call to cal.usage_log."""
+    # Sonnet 4.5 pricing: $3/MTok in, $15/MTok out
+    cost = (tokens_in * 3.0 / 1_000_000) + (tokens_out * 15.0 / 1_000_000)
+    try:
+        sb_post("usage_log", {
+            "company_id": company_id,
+            "user_id": user_id,
+            "endpoint": endpoint,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_usd": round(cost, 6),
+        })
+    except Exception as e:
+        logger.warning(f"[METER] Failed to log usage: {e}")
+
+def _check_ai_budget(company_id: int) -> tuple[bool, float, float]:
+    """Check if company is within AI budget. Returns (allowed, used, cap)."""
+    monthly_cost = _get_monthly_ai_cost(company_id)
+    company = sb_get("companies", {"select": "subscription_plan", "id": f"eq.{company_id}"})
+    plan = company[0]["subscription_plan"] if company else "basic"
+    cap = PLAN_AI_CAPS.get(plan, PLAN_AI_CAPS["basic"])
+    return monthly_cost < cap, monthly_cost, cap
+
+def call_agent_metered(company_id: int, user_id: int | None, endpoint: str,
+                       kernel: str, user_message: str, context: str = "") -> dict:
+    """Metered wrapper around call_agent — enforces budget, logs usage."""
+    allowed, used, cap = _check_ai_budget(company_id)
+    if not allowed:
+        return {
+            "text": f"Monthly AI usage limit reached (${used:.2f}/${cap:.2f}). Contact support to upgrade your plan.",
+            "input_tokens": 0, "output_tokens": 0, "budget_exceeded": True,
+        }
+
+    result = call_agent(kernel, user_message, context)
+    _log_usage(company_id, user_id, endpoint,
+               result.get("input_tokens", 0), result.get("output_tokens", 0))
+    return result
+
+
 # ============================================================
 # AUTH ENDPOINTS
 # ============================================================
@@ -445,7 +639,7 @@ def call_agent(kernel: str, user_message: str, context: str = "") -> dict:
 async def login(req: LoginRequest):
     # Fetch user via REST
     users = sb_get("users", {
-        "select": "id,password_hash,company_id,role",
+        "select": "id,password_hash,company_id,role,force_reset,security_question",
         "email": f"eq.{req.email}",
         "is_active": "eq.true",
     })
@@ -473,11 +667,415 @@ async def login(req: LoginRequest):
         "exp": datetime.utcnow() + timedelta(days=TOKEN_EXPIRE_DAYS),
     }, SECRET_KEY, algorithm=ALGORITHM)
 
+    force_reset = user.get("force_reset", False)
+    challenges_set = user.get("security_question") is not None and user.get("security_question") != ""
+
     return {
         "token": token,
         "company_name": company_name,
         "role": user["role"],
+        "force_reset": force_reset,
+        "challenges_set": challenges_set,
     }
+
+
+@app.get("/auth/challenge-questions")
+async def get_challenge_questions():
+    """Return the standard list of challenge questions."""
+    return {"questions": CHALLENGE_QUESTIONS}
+
+
+@app.post("/auth/set-challenges")
+async def set_challenges(req: ChallengeSetupRequest, auth: dict = Depends(verify_token)):
+    """Set challenge Q&A and new password. Called after first login when force_reset=True."""
+    user_id = auth["user_id"]
+
+    # Validate questions are from the standard list
+    for q in [req.question_1, req.question_2, req.question_3]:
+        if q not in CHALLENGE_QUESTIONS:
+            raise HTTPException(status_code=400, detail=f"Invalid question: {q}")
+
+    # All 3 questions must be different
+    if len({req.question_1, req.question_2, req.question_3}) < 3:
+        raise HTTPException(status_code=400, detail="All 3 questions must be different")
+
+    # Answers must be at least 2 chars
+    for a in [req.answer_1, req.answer_2, req.answer_3]:
+        if len(a.strip()) < 2:
+            raise HTTPException(status_code=400, detail="Answers must be at least 2 characters")
+
+    # Password must be at least 8 chars
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    # Hash answers (lowercase + stripped for consistency)
+    sb_patch("users", {"id": f"eq.{user_id}"}, {
+        "password_hash": pwd_context.hash(req.new_password),
+        "security_question": req.question_1,
+        "security_answer_hash": pwd_context.hash(req.answer_1.strip().lower()),
+        "security_question_2": req.question_2,
+        "security_answer_hash_2": pwd_context.hash(req.answer_2.strip().lower()),
+        "security_question_3": req.question_3,
+        "security_answer_hash_3": pwd_context.hash(req.answer_3.strip().lower()),
+        "force_reset": False,
+        "challenge_set_at": datetime.utcnow().isoformat(),
+    })
+
+    return {"status": "success", "message": "Password and challenge questions set. Please login with your new password."}
+
+
+@app.post("/auth/challenge-lookup")
+async def challenge_lookup(req: dict):
+    """Given an email, return the 3 challenge questions (not answers)."""
+    email = req.get("email", "")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    users = sb_get("users", {
+        "select": "security_question,security_question_2,security_question_3",
+        "email": f"eq.{email}",
+        "is_active": "eq.true",
+    })
+    if not users:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    user = users[0]
+    if not user.get("security_question"):
+        raise HTTPException(status_code=400, detail="Challenge questions not set. Contact your administrator.")
+
+    return {
+        "question_1": user["security_question"],
+        "question_2": user.get("security_question_2", ""),
+        "question_3": user.get("security_question_3", ""),
+    }
+
+
+@app.post("/auth/challenge-reset")
+async def challenge_reset(req: ChallengeResetRequest):
+    """Reset password by answering all 3 challenge questions correctly."""
+    users = sb_get("users", {
+        "select": "id,security_answer_hash,security_answer_hash_2,security_answer_hash_3",
+        "email": f"eq.{req.email}",
+        "is_active": "eq.true",
+    })
+    if not users:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    user = users[0]
+
+    if not user.get("security_answer_hash"):
+        raise HTTPException(status_code=400, detail="Challenge questions not set")
+
+    # Verify all 3 answers (case-insensitive)
+    checks = [
+        ("answer_1", user.get("security_answer_hash", ""), req.answer_1),
+        ("answer_2", user.get("security_answer_hash_2", ""), req.answer_2),
+        ("answer_3", user.get("security_answer_hash_3", ""), req.answer_3),
+    ]
+    for label, stored_hash, provided in checks:
+        if not stored_hash or not pwd_context.verify(provided.strip().lower(), stored_hash):
+            raise HTTPException(status_code=401, detail="One or more answers are incorrect")
+
+    # Password validation
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    # Reset password
+    sb_patch("users", {"id": f"eq.{user['id']}"}, {
+        "password_hash": pwd_context.hash(req.new_password),
+        "force_reset": False,
+    })
+
+    return {"status": "success", "message": "Password reset successful. Please login."}
+
+
+@app.post("/auth/change-password")
+async def change_password(req: ChangePasswordRequest, auth: dict = Depends(verify_token)):
+    """Change password for logged-in user (requires current password)."""
+    user_id = auth["user_id"]
+
+    users = sb_get("users", {"select": "password_hash", "id": f"eq.{user_id}"})
+    if not users:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not pwd_context.verify(req.current_password, users[0]["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+    sb_patch("users", {"id": f"eq.{user_id}"}, {
+        "password_hash": pwd_context.hash(req.new_password),
+    })
+
+    return {"status": "success", "message": "Password changed"}
+
+
+# ============================================================
+# COMPANY MANAGEMENT (admin endpoints)
+# ============================================================
+
+@app.get("/admin/companies")
+async def list_companies(auth: dict = Depends(verify_token)):
+    """List all companies. Admin/company_admin only."""
+    if auth["role"] not in ("admin", "company_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # company_admin sees only their company; admin sees all
+    params = {"select": "id,name,slug,subscription_plan,max_users,max_tools,is_active"}
+    if auth["role"] == "company_admin":
+        params["id"] = f"eq.{auth['company_id']}"
+
+    return {"companies": sb_get("companies", params)}
+
+
+@app.get("/admin/company/{company_id}/users")
+async def list_company_users(company_id: int, auth: dict = Depends(verify_token)):
+    """List users for a company. Admin or matching company_admin."""
+    if auth["role"] == "company_admin" and auth["company_id"] != company_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if auth["role"] not in ("admin", "company_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    users = sb_get("users", {
+        "select": "id,email,first_name,last_name,role,is_active,force_reset,last_login_at,challenge_set_at",
+        "company_id": f"eq.{company_id}",
+        "order": "id.asc",
+    })
+
+    return {"users": users}
+
+
+@app.post("/admin/company/{company_id}/users")
+async def create_company_user(company_id: int, req: dict, auth: dict = Depends(verify_token)):
+    """Create a user within a company. Sets initial password to 1Bunting! with force_reset."""
+    if auth["role"] == "company_admin" and auth["company_id"] != company_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if auth["role"] not in ("admin", "company_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    email = req.get("email", "")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    # Check not taken
+    existing = sb_get("users", {"select": "id", "email": f"eq.{email}"})
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    # Feature gate: check user count limit
+    plan_limit = _check_plan_limit(company_id, "max_users")
+    if plan_limit:
+        current_users = len(sb_get("users", {"select": "id", "company_id": f"eq.{company_id}", "is_active": "eq.true"}))
+        if current_users >= plan_limit:
+            raise HTTPException(status_code=402, detail=f"User limit reached ({plan_limit}). Upgrade your plan.")
+
+    # Get next ID
+    all_users = sb_get("users", {"select": "id", "order": "id.desc", "limit": "1"})
+    next_id = (all_users[0]["id"] + 1) if all_users else 1
+
+    sb_post("users", {
+        "id": next_id,
+        "company_id": company_id,
+        "email": email,
+        "password_hash": pwd_context.hash("1Bunting!"),
+        "first_name": req.get("first_name", ""),
+        "last_name": req.get("last_name", ""),
+        "role": req.get("role", "user"),
+        "is_active": True,
+        "force_reset": True,
+    })
+
+    return {"status": "created", "user_id": next_id, "email": email, "initial_password": "1Bunting!"}
+
+
+@app.patch("/admin/users/{user_id}")
+async def update_user(user_id: int, req: dict, auth: dict = Depends(verify_token)):
+    """Update a user (role, active status, reset password). Admin/company_admin."""
+    if auth["role"] not in ("admin", "company_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Verify user belongs to admin's company
+    target = sb_get("users", {"select": "company_id", "id": f"eq.{user_id}"})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if auth["role"] == "company_admin" and target[0]["company_id"] != auth["company_id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    update_data = {}
+    if "role" in req:
+        update_data["role"] = req["role"]
+    if "is_active" in req:
+        update_data["is_active"] = req["is_active"]
+    if "first_name" in req:
+        update_data["first_name"] = req["first_name"]
+    if "last_name" in req:
+        update_data["last_name"] = req["last_name"]
+    if req.get("reset_password"):
+        update_data["password_hash"] = pwd_context.hash("1Bunting!")
+        update_data["force_reset"] = True
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    sb_patch("users", {"id": f"eq.{user_id}"}, update_data)
+    return {"status": "updated", "user_id": user_id}
+
+
+@app.get("/admin/company/{company_id}/settings")
+async def get_company_settings(company_id: int, auth: dict = Depends(verify_token)):
+    """Get all settings for a company."""
+    if auth["role"] == "company_admin" and auth["company_id"] != company_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if auth["role"] not in ("admin", "company_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    settings = sb_get("settings", {
+        "select": "id,key,value",
+        "company_id": f"eq.{company_id}",
+        "order": "key.asc",
+    })
+
+    return {"settings": {s["key"]: s["value"] for s in settings}}
+
+
+
+
+# ============================================================
+# NOTIFICATION PREFERENCES (GAP_03)
+# ============================================================
+
+@app.get("/cal/settings/notifications")
+async def get_notification_settings(auth: dict = Depends(verify_token)):
+    """Get notification preferences for the authenticated user's company."""
+    company_id = auth["company_id"]
+    settings = _get_company_settings(company_id)
+    notify_keys = [k for k in settings if k.startswith("notify_")]
+    return {"notifications": {k: settings[k] for k in notify_keys}}
+
+
+@app.put("/cal/settings/notifications")
+async def update_notification_settings(req: dict, auth: dict = Depends(verify_token)):
+    """Update notification preferences. Admin/company_admin only.
+    Body: {"notify_overdue_to": "email@...", "notify_critical_cc": "a@..,b@..", ...}
+    """
+    if auth["role"] not in ("admin", "company_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    company_id = auth["company_id"]
+
+    allowed_keys = {
+        "notify_overdue_to", "notify_overdue_cc",
+        "notify_critical_to", "notify_critical_cc",
+        "notify_warning_to", "notify_warning_cc",
+        "notify_purchasing_to", "notify_purchasing_cc",
+        "notify_summary_to", "notify_summary_cc",
+    }
+
+    updated = 0
+    for key, value in req.items():
+        if key not in allowed_keys:
+            continue
+        # Upsert: try patch first, then insert
+        existing = sb_get("settings", {
+            "select": "id",
+            "company_id": f"eq.{company_id}",
+            "key": f"eq.{key}",
+        })
+        if existing:
+            sb_patch("settings", {
+                "id": f"eq.{existing[0]['id']}",
+            }, {"value": value})
+        else:
+            all_settings = sb_get("settings", {"select": "id", "order": "id.desc", "limit": "1"})
+            next_id = (all_settings[0]["id"] + 1) if all_settings else 1
+            sb_post("settings", {
+                "id": next_id,
+                "company_id": company_id,
+                "key": key,
+                "value": value,
+            })
+        updated += 1
+
+    return {"status": "updated", "fields": updated}
+
+
+# ============================================================
+# FEATURE GATES (GAP_04)
+# ============================================================
+
+def _check_plan_limit(company_id: int, feature: str):
+    """Get a plan feature limit for a company. Returns the limit value."""
+    company = sb_get("companies", {"select": "subscription_plan", "id": f"eq.{company_id}"})
+    plan = company[0]["subscription_plan"] if company else "basic"
+    limits = PLAN_FEATURES.get(plan, PLAN_FEATURES["basic"])
+    return limits.get(feature)
+
+
+@app.get("/cal/plan")
+async def get_plan_info(auth: dict = Depends(verify_token)):
+    """Return current plan details and usage for the company."""
+    company_id = auth["company_id"]
+    company = sb_get("companies", {"select": "subscription_plan,max_users,max_tools,name", "id": f"eq.{company_id}"})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    plan = company[0]["subscription_plan"]
+    features = PLAN_FEATURES.get(plan, PLAN_FEATURES["basic"])
+
+    # Current usage
+    tool_count = len(sb_get("tools", {"select": "id", "company_id": f"eq.{company_id}", "active": "eq.true"}))
+    user_count = len(sb_get("users", {"select": "id", "company_id": f"eq.{company_id}", "is_active": "eq.true"}))
+
+    # Monthly AI cost
+    month_start = date.today().replace(day=1).isoformat()
+    try:
+        usage = sb_get("usage_log", {
+            "select": "cost_usd",
+            "company_id": f"eq.{company_id}",
+            "created_at": f"gte.{month_start}",
+        })
+        monthly_ai_cost = round(sum(float(u.get("cost_usd", 0)) for u in usage), 2)
+    except Exception:
+        monthly_ai_cost = 0.0
+
+    return {
+        "company": company[0]["name"],
+        "plan": plan,
+        "features": features,
+        "usage": {
+            "tools": tool_count,
+            "tools_limit": features["max_tools"],
+            "users": user_count,
+            "users_limit": features["max_users"],
+            "ai_cost_this_month": monthly_ai_cost,
+            "ai_cost_limit": features["ai_cost_cap"],
+        },
+    }
+
+
+@app.get("/cal/pricing")
+async def get_pricing():
+    """Public pricing tiers for Cal Agent."""
+    tiers = []
+    pricing = {
+        "founder": {"price": 100, "label": "Founder"},
+        "professional": {"price": 250, "label": "Professional"},
+        "enterprise": {"price": 500, "label": "Enterprise"},
+    }
+    for plan_key, info in pricing.items():
+        features = PLAN_FEATURES.get(plan_key, {})
+        tiers.append({
+            "plan": plan_key,
+            "label": info["label"],
+            "price_monthly": info["price"],
+            "max_tools": features.get("max_tools"),
+            "max_users": features.get("max_users"),
+            "ai_cost_cap": features.get("ai_cost_cap"),
+            "branded_pdf": features.get("branded_pdf"),
+            "api_access": features.get("api_access"),
+        })
+    return {"tiers": tiers}
+
 
 @app.post("/auth/register")
 async def register(req: RegisterRequest):
@@ -492,8 +1090,13 @@ async def register(req: RegisterRequest):
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
+    # Generate next user ID (cal.users has no auto-increment)
+    all_users = sb_get("users", {"select": "id", "order": "id.desc", "limit": "1"})
+    next_id = (all_users[0]["id"] + 1) if all_users else 1
+
     password_hash = pwd_context.hash(req.password)
     sb_post("users", {
+        "id": next_id,
         "company_id": company_id,
         "email": req.email,
         "password_hash": password_hash,
@@ -503,6 +1106,210 @@ async def register(req: RegisterRequest):
     })
 
     return {"status": "success", "message": "User created. Please login."}
+
+
+# ============================================================
+# SELF-SERVE SIGNUP + STRIPE CHECKOUT (B1/B2/B3)
+# ============================================================
+
+import stripe as stripe_lib
+stripe_lib.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID", "")
+
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    company_name: str
+    contact_name: str
+    contact_phone: str = ""
+
+
+class CheckoutRequest(BaseModel):
+    company_id: int
+    user_id: int
+    email: str
+
+
+@app.post("/auth/signup")
+async def self_serve_signup(req: SignupRequest):
+    """
+    Public self-serve signup. Creates company (inactive) + admin user (inactive).
+    Returns IDs to proceed to Stripe checkout.
+    """
+    # Validate email not already taken
+    existing = sb_get("users", {"select": "id", "email": f"eq.{req.email}"})
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    # Generate slug from company name
+    slug = re.sub(r"[^a-z0-9]+", "-", req.company_name.lower()).strip("-")
+    existing_co = sb_get("companies", {"select": "id", "slug": f"eq.{slug}"})
+    if existing_co:
+        slug = f"{slug}-{uuid.uuid4().hex[:6]}"
+
+    # Get next IDs (cal.companies and cal.users have no auto-increment)
+    all_companies = sb_get("companies", {"select": "id", "order": "id.desc", "limit": "1"})
+    next_company_id = (all_companies[0]["id"] + 1) if all_companies else 1
+
+    all_users = sb_get("users", {"select": "id", "order": "id.desc", "limit": "1"})
+    next_user_id = (all_users[0]["id"] + 1) if all_users else 1
+
+    # Create company (inactive until payment)
+    company = sb_post("companies", {
+        "id": next_company_id,
+        "name": req.company_name,
+        "slug": slug,
+        "subscription_plan": "founder",
+        "max_users": 10,
+        "max_tools": 200,
+        "is_active": False,
+    })
+    company_id = company["id"]
+
+    # Create admin user (inactive until payment)
+    name_parts = req.contact_name.strip().split(" ", 1)
+    first_name = name_parts[0]
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+    password_hash = pwd_context.hash(req.password)
+
+    user = sb_post("users", {
+        "id": next_user_id,
+        "email": req.email,
+        "password_hash": password_hash,
+        "first_name": first_name,
+        "last_name": last_name,
+        "role": "company_admin",
+        "company_id": company_id,
+        "is_active": False,
+    })
+    user_id = user["id"]
+
+    logger.info(f"SIGNUP_PENDING company={company_id} slug={slug} email={req.email}")
+
+    return {
+        "company_id": company_id,
+        "user_id": user_id,
+        "slug": slug,
+        "message": "Account created. Proceed to checkout.",
+    }
+
+
+@app.post("/cal/checkout")
+async def create_checkout(req: CheckoutRequest):
+    """
+    Creates a Stripe Checkout session for the Cal Agent subscription.
+    Called after /auth/signup — takes company_id and user_id from signup response.
+    """
+    if not STRIPE_PRICE_ID:
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+
+    try:
+        session = stripe_lib.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            customer_email=req.email,
+            metadata={
+                "company_id": str(req.company_id),
+                "user_id": str(req.user_id),
+            },
+            success_url="https://cal.gp3.app/welcome?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="https://cal.gp3.app/signup",
+        )
+    except Exception as e:
+        logger.error(f"Stripe checkout error: {e}")
+        raise HTTPException(status_code=502, detail="Payment service error")
+
+    return {"checkout_url": session.url}
+
+
+@app.post("/cal/webhook/stripe")
+async def stripe_webhook(request: Request):
+    """
+    Stripe webhook — activates tenant on successful payment.
+    Must receive raw body for signature verification.
+    """
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            event = stripe_lib.Webhook.construct_event(
+                payload, sig, STRIPE_WEBHOOK_SECRET
+            )
+        except stripe_lib.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    else:
+        event = json.loads(payload)
+
+    if event.get("type") == "checkout.session.completed":
+        session_data = event["data"]["object"]
+        meta = session_data.get("metadata", {})
+        company_id = meta.get("company_id")
+        user_id = meta.get("user_id")
+
+        if company_id and user_id:
+            # Activate company
+            sb_patch("companies", {"id": f"eq.{company_id}"}, {
+                "is_active": True,
+                "subscription_plan": "founder",
+            })
+
+            # Activate user
+            sb_patch("users", {"id": f"eq.{user_id}"}, {
+                "is_active": True,
+            })
+
+            # Store Stripe IDs in settings table
+            stripe_customer = session_data.get("customer", "")
+            stripe_sub = session_data.get("subscription", "")
+            for key, val in [
+                ("stripe_customer_id", stripe_customer),
+                ("stripe_subscription_id", stripe_sub),
+            ]:
+                try:
+                    sb_post("settings", {
+                        "company_id": int(company_id),
+                        "key": key,
+                        "value": val,
+                    })
+                except Exception:
+                    pass
+
+            # Seed default calibration settings
+            for key, val in [
+                ("cal_interval_default", "365"),
+                ("alert_days_before_due", "30"),
+                ("ai_analysis_enabled", "true"),
+            ]:
+                try:
+                    sb_post("settings", {
+                        "company_id": int(company_id),
+                        "key": key,
+                        "value": val,
+                    })
+                except Exception:
+                    pass
+
+            logger.info(
+                f"TENANT_ACTIVATED company={company_id} user={user_id} "
+                f"stripe_customer={stripe_customer}"
+            )
+
+    elif event.get("type") == "customer.subscription.deleted":
+        # Deactivate tenant on subscription cancellation
+        session_data = event["data"]["object"]
+        meta = session_data.get("metadata", {})
+        company_id = meta.get("company_id")
+        if company_id:
+            sb_patch("companies", {"id": f"eq.{company_id}"}, {"is_active": False})
+            logger.info(f"TENANT_DEACTIVATED company={company_id} (subscription cancelled)")
+
+    return {"status": "ok"}
 
 
 class PortalExchangeRequest(BaseModel):
@@ -517,7 +1324,7 @@ async def portal_exchange(req: PortalExchangeRequest):
         r = httpx.get(
             f"{SUPABASE_URL}/auth/v1/user",
             headers={
-                "apikey": SUPABASE_KEY,
+                "apikey": SUPABASE_SERVICE_KEY,
                 "Authorization": f"Bearer {req.supabase_token}",
             },
             timeout=10,
@@ -595,8 +1402,8 @@ async def upload_cert(
         r = httpx.post(
             f"{SUPABASE_URL}/storage/v1/object/tenant-files/{storage_path}",
             headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                 "Content-Type": file.content_type or "application/octet-stream",
                 "x-upsert": "true",
             },
@@ -629,7 +1436,7 @@ Return ONLY a valid JSON object:
 }}
 result values: pass=within spec, adjusted=corrected during visit (usable), out_of_tolerance=out of spec not corrected, fail=failed unknown cause, conditional=needs human review"""
 
-    agent_response = call_agent(kernel, prompt)
+    agent_response = call_agent_metered(company_id, auth.get("user_id"), "/cal/upload", kernel, prompt)
 
     try:
         data = json.loads(agent_response["text"])
@@ -812,7 +1619,9 @@ async def ask_question(
     except Exception:
         memory_context = ""
 
-    system_prompt = f"""{kernel}
+    system_prompt = f"""{CAL_KERNEL}
+
+{kernel}
 
 ---
 {faq_knowledge}
@@ -838,9 +1647,16 @@ INSTRUCTIONS:
 """
 
     # Call Claude with tool use (agentic loop)
+    # Budget check (GAP_01)
+    allowed, used, cap = _check_ai_budget(company_id)
+    if not allowed:
+        return {"status": "success", "answer": f"Monthly AI usage limit reached (${used:.2f}/${cap:.2f}). Contact support to upgrade your plan."}
+
     messages = [{"role": "user", "content": req.question}]
     max_turns = 5
     final_text = ""
+    total_in_tokens = 0
+    total_out_tokens = 0
 
     for _ in range(max_turns):
         response = anthropic_client.messages.create(
@@ -850,6 +1666,10 @@ INSTRUCTIONS:
             tools=[CAL_SQL_TOOL],
             messages=messages,
         )
+
+        # Accumulate token usage for metering
+        total_in_tokens += response.usage.input_tokens
+        total_out_tokens += response.usage.output_tokens
 
         # Process response blocks
         tool_calls = []
@@ -876,6 +1696,9 @@ INSTRUCTIONS:
                 })
 
         messages.append({"role": "user", "content": tool_results})
+
+    # Log metered usage (GAP_01)
+    _log_usage(company_id, auth.get("user_id"), "/cal/question", total_in_tokens, total_out_tokens)
 
     # Store Q&A in conversation memory for learning via REST
     try:
@@ -973,7 +1796,7 @@ Records:
         for r in records
     ])
 
-    agent_response = call_agent(kernel, prompt)
+    agent_response = call_agent_metered(company_id, auth.get("user_id"), "/cal/download", kernel, prompt)
 
     if req.format == "pdf":
         branding = load_tenant_branding(company_id)
@@ -1036,6 +1859,13 @@ async def add_equipment(
     auth: dict = Depends(require_admin),
 ):
     company_id = auth["company_id"]
+
+    # Feature gate: check tool count limit
+    plan_limit = _check_plan_limit(company_id, "max_tools")
+    if plan_limit:
+        current_tools = len(sb_get("tools", {"select": "id", "company_id": f"eq.{company_id}", "active": "eq.true"}))
+        if current_tools >= plan_limit:
+            raise HTTPException(status_code=402, detail=f"Tool limit reached ({plan_limit}). Upgrade your plan.")
 
     sb_post("tools", {
         "company_id": company_id,
@@ -1204,13 +2034,115 @@ async def dashboard(
 # ============================================================
 
 @app.get("/health")
-async def health():
-    return {
+async def health(deep: bool = False):
+    result = {
         "status": "healthy",
         "product": "cal.gp3.app",
         "version": app.version,
         "timestamp": datetime.utcnow().isoformat(),
     }
+    if deep:
+        checks = {}
+        # Supabase SDK
+        try:
+            t0 = datetime.utcnow()
+            cal_table("companies").select("id").limit(1).execute()
+            latency = int((datetime.utcnow() - t0).total_seconds() * 1000)
+            checks["supabase"] = {"status": "ok", "latency_ms": latency}
+        except Exception as e:
+            checks["supabase"] = {"status": "unreachable", "error": str(e)[:100]}
+        # Anthropic key
+        checks["anthropic"] = {"status": "ok" if ANTHROPIC_API_KEY else "not_configured"}
+        # Mailgun
+        checks["mailgun"] = {"status": "ok" if MAILGUN_API_KEY else "not_configured"}
+        # Scheduler
+        checks["scheduler"] = {"status": "running" if scheduler.running else "stopped"}
+        result["checks"] = checks
+        all_ok = all(
+            c.get("status") in ("ok", "running") for c in checks.values()
+        )
+        result["status"] = "healthy" if all_ok else "degraded"
+    return result
+
+
+@app.get("/status")
+async def public_status():
+    """Public status page — no auth required."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        checks = sb_get("uptime_checks", {
+            "select": "status,checked_at,latency_ms",
+            "service": "eq.cal-backend",
+            "checked_at": f"gte.{cutoff}",
+            "order": "checked_at.desc",
+            "limit": "288",
+        })
+        total = len(checks)
+        healthy = sum(1 for c in checks if c["status"] == "healthy")
+        uptime_pct = round(healthy * 100.0 / max(total, 1), 2)
+        avg_latency = round(sum(c.get("latency_ms", 0) for c in checks) / max(total, 1))
+    except Exception:
+        checks, total, uptime_pct, avg_latency = [], 0, 0, 0
+
+    return {
+        "service": "cal.gp3.app",
+        "current_status": checks[0]["status"] if checks else "unknown",
+        "uptime_24h": f"{uptime_pct}%",
+        "avg_latency_ms": avg_latency,
+        "checks_24h": total,
+        "last_check": checks[0]["checked_at"] if checks else None,
+    }
+
+
+@app.get("/cal/usage")
+async def get_usage(auth: dict = Depends(verify_token)):
+    """Usage metering dashboard for current billing month."""
+    company_id = auth["company_id"]
+    month_start = date.today().replace(day=1).isoformat()
+
+    try:
+        usage = sb_get("usage_log", {
+            "select": "endpoint,tokens_in,tokens_out,cost_usd,created_at",
+            "company_id": f"eq.{company_id}",
+            "created_at": f"gte.{month_start}",
+            "order": "created_at.desc",
+            "limit": "500",
+        })
+    except Exception:
+        usage = []
+
+
+    total_cost = sum(float(u.get("cost_usd", 0)) for u in usage)
+    total_calls = len(usage)
+    total_tokens = sum(u.get("tokens_in", 0) + u.get("tokens_out", 0) for u in usage)
+
+    # Get plan cap
+    company = sb_get("companies", {"select": "subscription_plan", "id": f"eq.{company_id}"})
+    plan = company[0]["subscription_plan"] if company else "basic"
+    cap = PLAN_AI_CAPS.get(plan, PLAN_AI_CAPS["basic"])
+
+    # Breakdown by endpoint
+    by_endpoint = {}
+    for u in usage:
+        ep = u.get("endpoint", "unknown")
+        if ep not in by_endpoint:
+            by_endpoint[ep] = {"calls": 0, "cost_usd": 0.0, "tokens": 0}
+        by_endpoint[ep]["calls"] += 1
+        by_endpoint[ep]["cost_usd"] += float(u.get("cost_usd", 0))
+        by_endpoint[ep]["tokens"] += u.get("tokens_in", 0) + u.get("tokens_out", 0)
+
+    return {
+        "billing_month": month_start[:7],
+        "plan": plan,
+        "ai_cost_cap_usd": cap,
+        "total_cost_usd": round(total_cost, 4),
+        "budget_remaining_usd": round(cap - total_cost, 4),
+        "budget_used_pct": round(total_cost * 100 / max(cap, 0.01), 1),
+        "total_calls": total_calls,
+        "total_tokens": total_tokens,
+        "by_endpoint": {k: {**v, "cost_usd": round(v["cost_usd"], 4)} for k, v in by_endpoint.items()},
+    }
+
 
 # ============================================================
 # AUTONOMOUS ENFORCEMENT — Scheduled Jobs
@@ -1365,7 +2297,7 @@ Return ONLY a valid JSON object:
 result: pass=within spec, adjusted=corrected during visit, out_of_tolerance=not corrected, fail=failed unknown cause, conditional=needs human review"""
 
     try:
-        agent_response = call_agent(kernel, prompt)
+        agent_response = call_agent_metered(company_id, None, "/api/email/cert", kernel, prompt)
         text = agent_response["text"]
         try:
             data = json.loads(text)
@@ -1396,7 +2328,7 @@ result: pass=within spec, adjusted=corrected during visit, out_of_tolerance=not 
     try:
         httpx.post(
             f"{SUPABASE_URL}/storage/v1/object/tenant-files/{storage_path}",
-            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+            headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                      "Content-Type": mime_type or "application/octet-stream", "x-upsert": "true"},
             content=content, timeout=30,
         ).raise_for_status()
@@ -1697,8 +2629,38 @@ def refresh_statuses():
     logger.info(f"[CRON] refresh_statuses: updated {updated} tools")
     return updated
 
+def _should_alert_tool(tool: dict, level: str, days: int) -> bool:
+    """Check if we should send an alert for this tool (dedup logic).
+    Only alert if: level changed, OR same level but last alert was 7+ days ago."""
+    last_level = tool.get("last_alert_level", "")
+    last_sent = tool.get("last_alert_sent_at")
+    if not last_sent:
+        return True
+    if last_level != level:
+        return True
+    try:
+        sent_date = date.fromisoformat(str(last_sent)[:10])
+        if (date.today() - sent_date).days >= 7:
+            return True
+    except (ValueError, TypeError):
+        return True
+    return False
+
+
+def _mark_tool_alerted(tool_id: int, level: str):
+    """Update last_alert_sent_at and last_alert_level on a tool."""
+    try:
+        sb_patch("tools", {"id": f"eq.{tool_id}"}, {
+            "last_alert_sent_at": datetime.utcnow().isoformat(),
+            "last_alert_level": level,
+        })
+    except Exception as e:
+        logger.warning(f"[ALERT] Failed to mark tool {tool_id} as alerted: {e}")
+
+
 def enforcement_scan():
-    """Scan all companies for overdue/expiring tools and send enforcement emails."""
+    """Scan all companies for overdue/expiring tools and send enforcement emails.
+    Features: alert dedup (per-tool), progressive milestones (30/14/7/3/1/0d)."""
     companies = sb_get("companies", {"select": "id,name,slug"})
     today = date.today()
     total_emails = 0
@@ -1707,17 +2669,15 @@ def enforcement_scan():
         cid, co_name, slug = co["id"], co["name"], co["slug"]
         sender = f"Cal - {co_name} <cal@{slug}.gp3.app>"
 
-        # Load tenant kernel for routing config
         kernel_path = Path(f"/app/kernels/tenants/{slug}.ttc.md")
         if not kernel_path.exists():
-            continue  # no kernel = not onboarded
+            continue
 
-        # Load per-company notification recipients from cal.settings
         notify = _get_company_settings(cid)
         signature = _build_email_signature(cid)
 
         tools = sb_get("tools", {
-            "select": "id,asset_tag,tool_name,tool_type,calibration_method,calibrating_entity,calibration_status,next_due_date",
+            "select": "id,asset_tag,tool_name,tool_type,calibration_method,calibrating_entity,calibration_status,next_due_date,last_alert_sent_at,last_alert_level",
             "company_id": f"eq.{cid}",
             "active": "eq.true",
             "order": "next_due_date.asc.nullslast",
@@ -1726,6 +2686,8 @@ def enforcement_scan():
         overdue = []
         critical = []
         warning = []
+        milestone_alerts = []  # tools hitting exact milestone days
+
         for t in tools:
             ndd = t.get("next_due_date")
             if not ndd:
@@ -1735,14 +2697,27 @@ def enforcement_scan():
                 days = (due - today).days
             except (ValueError, TypeError):
                 continue
-            if days < 0:
-                overdue.append(t)
-            elif days <= 7:
-                critical.append(t)
-            elif days <= 30:
-                warning.append(t)
 
-        # --- OVERDUE: Demand immediate removal from service ---
+            t["_days_until"] = days
+
+            if days < 0:
+                level = "overdue"
+                if _should_alert_tool(t, level, days):
+                    overdue.append(t)
+            elif days <= 7:
+                level = "critical"
+                if _should_alert_tool(t, level, days):
+                    critical.append(t)
+            elif days <= 30:
+                level = "warning"
+                if _should_alert_tool(t, level, days):
+                    warning.append(t)
+
+            # Check progressive milestones (exact day match)
+            if days in ALERT_MILESTONES and t.get("last_alert_level") != f"milestone-d{days}":
+                milestone_alerts.append(t)
+
+        # --- OVERDUE ---
         if overdue:
             table_html = _build_tool_table_html(overdue)
             body = f"""<div style="font-family:Helvetica,sans-serif;">
@@ -1767,8 +2742,10 @@ def enforcement_scan():
                 _log_email(cid, sender, to, f"[ACTION REQUIRED] {len(overdue)} Overdue Calibrations", body, "sent" if sent else "failed")
                 if sent:
                     total_emails += 1
+                    for t in overdue:
+                        _mark_tool_alerted(t["id"], "overdue")
 
-        # --- CRITICAL: Due within 7 days ---
+        # --- CRITICAL (<=7d) ---
         if critical:
             table_html = _build_tool_table_html(critical)
             body = f"""<div style="font-family:Helvetica,sans-serif;">
@@ -1787,11 +2764,12 @@ def enforcement_scan():
                 _log_email(cid, sender, to, f"[URGENT] {len(critical)} Calibrations Due Within 7 Days", body, "sent" if sent else "failed")
                 if sent:
                     total_emails += 1
+                    for t in critical:
+                        _mark_tool_alerted(t["id"], "critical")
 
-        # --- WARNING: Due within 30 days ---
+        # --- WARNING (<=30d) ---
         if warning:
             table_html = _build_tool_table_html(warning)
-            # Split vendor-calibrated tools for purchasing notification
             vendor_tools = [t for t in warning if t.get("calibration_method", "").lower().startswith("vendor")]
             body = f"""<div style="font-family:Helvetica,sans-serif;">
 <h2 style="color:#003366;">[NOTICE] {len(warning)} Calibrations Due Within 30 Days</h2>
@@ -1808,8 +2786,10 @@ def enforcement_scan():
                 _log_email(cid, sender, to, f"[NOTICE] {len(warning)} Calibrations Due Within 30 Days", body, "sent" if sent else "failed")
                 if sent:
                     total_emails += 1
+                    for t in warning:
+                        _mark_tool_alerted(t["id"], "warning")
 
-            # --- PURCHASING: Vendor-calibrated tools need PO ---
+            # Purchasing notification for vendor-calibrated tools
             if vendor_tools:
                 vendor_table = _build_tool_table_html(vendor_tools)
                 po_body = f"""<div style="font-family:Helvetica,sans-serif;">
@@ -1828,6 +2808,60 @@ def enforcement_scan():
                     _log_email(cid, sender, to, f"[CAL REQUEST] {len(vendor_tools)} Vendor Calibrations", po_body, "sent" if sent else "failed")
                     if sent:
                         total_emails += 1
+
+        # --- PROGRESSIVE MILESTONE ALERTS ---
+        for t in milestone_alerts:
+            days = t["_days_until"]
+            tag = t.get("asset_tag", "?")
+            name = t.get("tool_name", "Unknown")
+            if days == 0:
+                subj = f"[TODAY] Calibration Due Today: {tag} — {name}"
+                color = "#CC0000"
+                urgency = "Calibration is due <strong>TODAY</strong>."
+            elif days == 1:
+                subj = f"[TOMORROW] Calibration Due Tomorrow: {tag} — {name}"
+                color = "#CC3300"
+                urgency = "Calibration is due <strong>tomorrow</strong>."
+            elif days == 3:
+                subj = f"[3 DAYS] Calibration Due in 3 Days: {tag} — {name}"
+                color = "#CC6600"
+                urgency = "Calibration is due in <strong>3 days</strong>."
+            elif days == 7:
+                subj = f"[1 WEEK] Calibration Due in 7 Days: {tag} — {name}"
+                color = "#CC6600"
+                urgency = "Calibration is due in <strong>1 week</strong>."
+            elif days == 14:
+                subj = f"[2 WEEKS] Calibration Due in 14 Days: {tag} — {name}"
+                color = "#336699"
+                urgency = "Calibration is due in <strong>2 weeks</strong>."
+            elif days == 30:
+                subj = f"[30 DAYS] Calibration Due in 30 Days: {tag} — {name}"
+                color = "#003366"
+                urgency = "Calibration is due in <strong>30 days</strong>. Plan ahead."
+            else:
+                continue
+
+            body = f"""<div style="font-family:Helvetica,sans-serif;">
+<h2 style="color:{color};">{subj}</h2>
+<p>{urgency}</p>
+<table style="border-collapse:collapse;margin:12px 0;">
+<tr><td style="padding:4px 12px;font-weight:bold;">Asset Tag:</td><td>{tag}</td></tr>
+<tr><td style="padding:4px 12px;font-weight:bold;">Tool:</td><td>{name}</td></tr>
+<tr><td style="padding:4px 12px;font-weight:bold;">Type:</td><td>{t.get("tool_type","")}</td></tr>
+<tr><td style="padding:4px 12px;font-weight:bold;">Method:</td><td>{t.get("calibration_method","")}</td></tr>
+<tr><td style="padding:4px 12px;font-weight:bold;">Vendor:</td><td>{t.get("calibrating_entity","")}</td></tr>
+<tr><td style="padding:4px 12px;font-weight:bold;">Due Date:</td><td>{t.get("next_due_date","")}</td></tr>
+</table>
+{signature}
+</div>"""
+            to = notify.get("notify_critical_to", "") if days <= 7 else notify.get("notify_warning_to", "")
+            cc = notify.get("notify_critical_cc", "") if days <= 7 else notify.get("notify_warning_cc", "")
+            if to:
+                sent = _send_mailgun(sender, to, subj, body, cc)
+                _log_email(cid, sender, to, subj, body, "sent" if sent else "failed")
+                if sent:
+                    total_emails += 1
+                    _mark_tool_alerted(t["id"], f"milestone-d{days}")
 
     logger.info(f"[CRON] enforcement_scan: sent {total_emails} emails")
     return total_emails
@@ -1951,6 +2985,103 @@ def weekly_summary():
     return total_emails
 
 # --- Scheduler setup ---
+# ============================================================
+# UPTIME MONITOR (GAP_02) + BACKUP (GAP_05)
+# ============================================================
+
+def _uptime_check():
+    """Ping own /health?deep=true and log result to cal.uptime_checks."""
+    try:
+        t0 = datetime.utcnow()
+        r = httpx.get("http://127.0.0.1:8000/health?deep=true", timeout=10)
+        latency = int((datetime.utcnow() - t0).total_seconds() * 1000)
+        data = r.json()
+        status = data.get("status", "unknown")
+    except Exception as e:
+        latency = 0
+        status = "down"
+        data = {"error": str(e)[:200]}
+
+    try:
+        sb_post("uptime_checks", {
+            "service": "cal-backend",
+            "status": status,
+            "latency_ms": latency,
+            "details": json.dumps(data.get("checks", {})),
+        })
+    except Exception as e:
+        logger.warning(f"[UPTIME] Failed to log: {e}")
+
+def _backup_cal_data():
+    """Export all cal schema tables to JSON backup files."""
+    backup_dir = Path(f"/app/backups/{date.today().isoformat()}")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    tables = ["companies", "users", "tools", "calibrations", "attachments", "settings", "email_log"]
+    for table in tables:
+        try:
+            rows = sb_get(table, {"select": "*", "limit": "10000"})
+            if rows:
+                with open(backup_dir / f"{table}.json", "w") as f:
+                    json.dump(rows, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"[BACKUP] Failed to export {table}: {e}")
+
+    # Prune backups older than 30 days
+    backups_root = Path("/app/backups")
+    if backups_root.exists():
+        cutoff = date.today() - timedelta(days=30)
+        for d in backups_root.iterdir():
+            if d.is_dir():
+                try:
+                    dir_date = date.fromisoformat(d.name)
+                    if dir_date < cutoff:
+                        import shutil
+                        shutil.rmtree(d)
+                except (ValueError, OSError):
+                    pass
+
+    logger.info(f"[BACKUP] Exported {len(tables)} tables to {backup_dir}")
+
+
+def _restore_from_backup(backup_dir_path: str) -> dict:
+    """Restore cal schema tables from JSON backup files. Returns summary."""
+    from pathlib import Path as P
+    backup_dir = P(backup_dir_path)
+    if not backup_dir.exists():
+        return {"error": f"Backup directory not found: {backup_dir_path}"}
+
+    restore_order = ["companies", "users", "settings", "tools", "calibrations", "attachments", "email_log"]
+    results = {}
+
+    for table in restore_order:
+        filepath = backup_dir / f"{table}.json"
+        if not filepath.exists():
+            results[table] = "skipped (no file)"
+            continue
+
+        with open(filepath) as f:
+            rows = json.load(f)
+
+        restored = 0
+        errors = 0
+        for row in rows:
+            row.pop("created_at", None)
+            row.pop("updated_at", None)
+            try:
+                sb_post(table, row)
+                restored += 1
+            except Exception as e:
+                if "duplicate" in str(e).lower() or "already exists" in str(e).lower():
+                    restored += 1  # already there
+                else:
+                    errors += 1
+                    logger.warning(f"[RESTORE] {table} id={row.get('id')}: {e}")
+        results[table] = f"{restored} restored, {errors} errors"
+
+    return results
+
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager
 
@@ -1962,8 +3093,10 @@ async def lifespan(app):
     scheduler.add_job(refresh_statuses, "cron", hour=5, minute=0, id="refresh_statuses", replace_existing=True)
     scheduler.add_job(enforcement_scan, "cron", hour=6, minute=0, id="enforcement_scan", replace_existing=True)
     scheduler.add_job(weekly_summary, "cron", day_of_week="mon", hour=7, minute=0, id="weekly_summary", replace_existing=True)
+    scheduler.add_job(_uptime_check, "interval", minutes=5, id="uptime_check", replace_existing=True)
+    scheduler.add_job(_backup_cal_data, "cron", hour=2, minute=0, id="backup_cal", replace_existing=True)
     scheduler.start()
-    logger.info("[SCHEDULER] Started — refresh@05:00, enforce@06:00, summary@Mon07:00 CT")
+    logger.info("[SCHEDULER] Started — refresh@05:00, enforce@06:00, summary@Mon07:00, uptime@5min, backup@02:00 CT")
     yield
     # Shutdown
     scheduler.shutdown(wait=False)
@@ -2245,7 +3378,7 @@ Return ONLY a JSON object: {"category": "CATEGORY", "summary": "1-sentence summa
 
     try:
         kernel = load_tenant_kernel(None, company_id)
-        classification = call_agent(kernel, classification_prompt, context)
+        classification = call_agent_metered(company_id, None, "/api/email/classify", kernel, classification_prompt, context)
         result_data = json.loads(classification["text"]) if classification["text"].strip().startswith("{") else {"category": "OTHER", "summary": classification["text"][:200]}
     except Exception:
         result_data = {"category": "OTHER", "summary": "Could not classify", "error": True}
@@ -2554,3 +3687,73 @@ async def provision_tenant(req: ProvisionRequest, request: Request):
         "login_url": f"https://cal.gp3.app/login",
         "plan": req.plan,
     }
+
+
+# ============================================================
+# KERNEL MANAGEMENT (admin + super-admin)
+# ============================================================
+
+class KernelUpdateRequest(BaseModel):
+    content: str
+    changelog_note: str = ""
+
+def require_kernel_access(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """
+    Kernel editor auth: X-Service-Key (super admin, any company)
+    or JWT with role=admin (tenant admin, own company only).
+    """
+    service_key = request.headers.get("x-service-key", "")
+    if service_key == CAL_SERVICE_KEY:
+        return {"is_super": True, "company_id": None}
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("role") not in ("admin", "company_admin"):
+            raise HTTPException(status_code=403, detail="Admin access required")
+        return {"is_super": False, "company_id": payload["company_id"]}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@app.get("/cal/kernel/{company_slug}")
+async def get_kernel(company_slug: str, access: dict = Depends(require_kernel_access)):
+    """Get tenant kernel content by company slug."""
+    companies = sb_get("companies", {"select": "id,name,slug", "slug": f"eq.{company_slug}"})
+    if not companies:
+        raise HTTPException(status_code=404, detail=f"Company '{company_slug}' not found")
+    company = companies[0]
+    if not access["is_super"] and company["id"] != access["company_id"]:
+        raise HTTPException(status_code=403, detail="Access denied to this company's kernel")
+    kernel_path = Path(f"/app/kernels/tenants/{company_slug}.ttc.md")
+    content = kernel_path.read_text() if kernel_path.exists() else ""
+    return {
+        "slug": company_slug,
+        "company_name": company["name"],
+        "content": content,
+        "exists": kernel_path.exists(),
+    }
+
+@app.put("/cal/kernel/{company_slug}")
+async def update_kernel(company_slug: str, req: KernelUpdateRequest, request: Request, access: dict = Depends(require_kernel_access)):
+    """Update tenant kernel content. Saves to disk and logs version to Supabase."""
+    companies = sb_get("companies", {"select": "id,name,slug", "slug": f"eq.{company_slug}"})
+    if not companies:
+        raise HTTPException(status_code=404, detail=f"Company '{company_slug}' not found")
+    company = companies[0]
+    if not access["is_super"] and company["id"] != access["company_id"]:
+        raise HTTPException(status_code=403, detail="Access denied to this company's kernel")
+    kernel_path = Path(f"/app/kernels/tenants/{company_slug}.ttc.md")
+    previous = kernel_path.read_text() if kernel_path.exists() else None
+    kernel_path.parent.mkdir(parents=True, exist_ok=True)
+    kernel_path.write_text(req.content)
+    try:
+        sb_post("kernel_versions", {
+            "company_id": company["id"],
+            "slug": company_slug,
+            "content": req.content,
+            "previous_content": previous,
+            "changelog_note": req.changelog_note,
+            "edited_by": "super_admin" if access["is_super"] else f"admin:{access['company_id']}",
+        })
+    except Exception as e:
+        logger.warning(f"kernel version log failed (table may not exist yet): {e}")
+    logger.info(f"Kernel updated for {company_slug} ({len(req.content)} bytes)")
+    return {"status": "saved", "slug": company_slug, "bytes": len(req.content)}

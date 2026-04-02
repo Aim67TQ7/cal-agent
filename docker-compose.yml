@@ -1,17 +1,15 @@
-version: '3.8'
-
 # Co-located on Maggie VPS (89.116.157.23)
 # Caddy is handled by n0v8v stack — we join its network
-# Database: Supabase GP3 project (zoda) — cal schema
+# Database: Supabase GP3 project (zoda) — cal schema via SDK
 
 services:
   cal-backend:
     build: ./backend
     container_name: cal-backend
     environment:
-      DATABASE_URL: ${SUPABASE_DB_URL:-}
-      SUPABASE_URL: ${SUPABASE_URL:-https://ezlmmegowggujpcnzoda.supabase.co}
-      SUPABASE_KEY: ${SUPABASE_KEY}
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-${SUPABASE_KEY}}
+      GP3_COOKIE_DOMAIN: .gp3.app
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       SECRET_KEY: ${SECRET_KEY}
       ENVIRONMENT: ${ENVIRONMENT:-production}
@@ -19,9 +17,15 @@ services:
       EMAIL_WEBHOOK_SECRET: ${EMAIL_WEBHOOK_SECRET:-}
       MAILGUN_API_KEY: ${MAILGUN_API_KEY:-}
       MAILGUN_DOMAIN: ${MAILGUN_DOMAIN:-gp3.app}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
     volumes:
-      - ./kernels:/app/kernels:ro
+      - /opt/gp3-kernels:/opt/gp3-kernels:ro
+      - ./kernels:/app/kernels
       - cal-uploads:/app/uploads
+      - ./scripts:/app/scripts:ro
+      - cal-backups:/app/backups
     ports:
       - "127.0.0.1:8200:8000"
     restart: unless-stopped
@@ -30,6 +34,7 @@ services:
 
 volumes:
   cal-uploads:
+  cal-backups:
 
 networks:
   n0v8v_n0v8v-net:
